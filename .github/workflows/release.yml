@@ -1,0 +1,71 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate CLI script
+        run: |
+          bash -n devskin-cli.sh
+          echo "Syntax check passed"
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          cp devskin-cli.sh dist/devskin
+          cp install.sh dist/install.sh
+          chmod +x dist/devskin dist/install.sh
+          tar -czf dist/devskin-cli-${{ steps.version.outputs.version }}-linux.tar.gz -C dist devskin
+          cp dist/devskin-cli-${{ steps.version.outputs.version }}-linux.tar.gz dist/devskin-cli-${{ steps.version.outputs.version }}-darwin.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/devskin-cli-${{ steps.version.outputs.version }}-linux.tar.gz
+            dist/devskin-cli-${{ steps.version.outputs.version }}-darwin.tar.gz
+            dist/install.sh
+
+  update-installer:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload CLI to CDN
+        run: |
+          echo "TODO: Upload devskin-cli.sh to https://cloud-api.devskin.com/cli/devskin-cli.sh"
+          echo "TODO: Upload install.sh to https://cloud-api.devskin.com/cli/install.sh"
+          # Example with S3:
+          # aws s3 cp devskin-cli.sh s3://devskin-cli-releases/devskin-cli.sh --acl public-read
+          # aws s3 cp install.sh s3://devskin-cli-releases/install.sh --acl public-read
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew tap
+        run: |
+          echo "TODO: Update homebrew-tap repo with new formula for ${{ steps.version.outputs.version }}"
+          # Example: use a repository_dispatch to trigger the tap repo update
