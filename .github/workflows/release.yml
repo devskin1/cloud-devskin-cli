@@ -49,13 +49,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload CLI to CDN
+      - name: Verify release
         run: |
-          echo "TODO: Upload devskin-cli.sh to https://cloud-api.devskin.com/cli/devskin-cli.sh"
-          echo "TODO: Upload install.sh to https://cloud-api.devskin.com/cli/install.sh"
-          # Example with S3:
-          # aws s3 cp devskin-cli.sh s3://devskin-cli-releases/devskin-cli.sh --acl public-read
-          # aws s3 cp install.sh s3://devskin-cli-releases/install.sh --acl public-read
+          echo "CLI released via GitHub. Install with:"
+          echo "curl -fsSL https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/install.sh | bash"
 
   homebrew:
     needs: release
