@@ -12,7 +12,7 @@ set -euo pipefail
 VERSION="1.0.0"
 CONFIG_DIR="$HOME/.devskin"
 CONFIG_FILE="$CONFIG_DIR/config"
-API_URL="${DEVSKIN_API_URL:-https://api.devskin.cloud}"
+API_URL="${DEVSKIN_API_URL:-https://cloud-api.devskin.com/api}"
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
