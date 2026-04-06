@@ -7,13 +7,13 @@ The official command-line interface for [DevskinCloud](https://cloud.devskin.com
 ### Quick Install (Linux / macOS)
 
 ```bash
-curl -fsSL https://cloud-api.devskin.com/cli/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/install.sh | bash
 ```
 
 This downloads the CLI to `/usr/local/bin/devskin`. Override with `DEVSKIN_INSTALL_DIR`:
 
 ```bash
-DEVSKIN_INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://cloud-api.devskin.com/cli/install.sh | bash
+DEVSKIN_INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/install.sh | bash
 ```
 
 ### Homebrew (macOS / Linux)
