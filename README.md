@@ -16,19 +16,6 @@ This downloads the CLI to `/usr/local/bin/devskin`. Override with `DEVSKIN_INSTA
 DEVSKIN_INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/install.sh | bash
 ```
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew tap devskin/tap
-brew install devskin-cli
-```
-
-### Windows (winget)
-
-```powershell
-winget install DevskinCloud.CLI
-```
-
 ### Manual Install
 
 Download `devskin-cli.sh`, place it somewhere in your `$PATH`, and make it executable:
