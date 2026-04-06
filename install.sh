@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
 # DevskinCloud CLI Installer
-# Usage: curl -fsSL https://cloud-api.devskin.com/cli/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/install.sh | bash
 # ============================================================================
 
 set -euo pipefail
 
 INSTALL_DIR="${DEVSKIN_INSTALL_DIR:-/usr/local/bin}"
-CLI_URL="${DEVSKIN_CLI_URL:-https://cloud-api.devskin.com/cli/devskin-cli.sh}"
+CLI_URL="${DEVSKIN_CLI_URL:-https://raw.githubusercontent.com/devskin1/cloud-devskin-cli/main/devskin-cli.sh}"
 BINARY_NAME="devskin"
 
 # Colors
