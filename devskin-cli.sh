@@ -1262,7 +1262,7 @@ ${BOLD}Usage:${NC} devskin k8s <subcommand> [options]
 
 ${BOLD}Subcommands:${NC}
   list                              List all Kubernetes clusters
-  create --name NAME --version VERSION [--nodes COUNT] [--region REGION]
+  create --name NAME --version VERSION [--nodes COUNT] [--region REGION] [--vpc-id VPC_ID]
                                     Create a new cluster
   get ID                            Show cluster details
   delete ID                         Delete a cluster
@@ -1283,11 +1283,12 @@ k8s_list() {
 
 k8s_create() {
   _require_auth
-  local name version nodes region
+  local name version nodes region vpc_id
   name=$(_parse_flag "--name" "$@")
   version=$(_parse_flag "--version" "$@")
   nodes=$(_parse_flag "--nodes" "$@")
   region=$(_parse_flag "--region" "$@")
+  vpc_id=$(_parse_flag "--vpc-id" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--version" "$version"
@@ -1295,6 +1296,7 @@ k8s_create() {
   local payload="{\"name\":\"${name}\",\"version\":\"${version}\""
   [[ -n "$nodes" ]]  && payload="${payload},\"nodeCount\":${nodes}"
   [[ -n "$region" ]] && payload="${payload},\"region\":\"${region}\""
+  [[ -n "$vpc_id" ]] && payload="${payload},\"vpcId\":\"${vpc_id}\""
   payload="${payload}}"
 
   _info "Creating Kubernetes cluster ${BOLD}${name}${NC} ..."
@@ -3105,6 +3107,201 @@ container_scale() {
   data=$(_extract_data "$body")
 
   _success "Container service ${id} scaled to ${replicas} replicas."
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+#                       CONTAINER CLUSTER COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+
+cmd_container_cluster() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)       container_cluster_list "$@" ;;
+    create)     container_cluster_create "$@" ;;
+    get|show)   container_cluster_get "$@" ;;
+    delete)     container_cluster_delete "$@" ;;
+    help|*)     container_cluster_help ;;
+  esac
+}
+
+container_cluster_help() {
+  cat <<EOF
+${BOLD}Usage:${NC} devskin container-cluster <subcommand> [options]
+
+${BOLD}Subcommands:${NC}
+  list                              List all container clusters
+  create --name NAME --vpc-id VPC_ID [--region REGION]
+                                    Create a new container cluster
+  get ID                            Show container cluster details
+  delete ID                         Delete a container cluster
+EOF
+}
+
+container_cluster_list() {
+  _require_auth
+  local body
+  body=$(_api_get "/containers/clusters")
+  local data
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Container Clusters${NC}"
+  echo ""
+  echo "$data" | _format_table id name status region
+}
+
+container_cluster_create() {
+  _require_auth
+  local name vpc_id region
+  name=$(_parse_flag "--name" "$@")
+  vpc_id=$(_parse_flag "--vpc-id" "$@")
+  region=$(_parse_flag "--region" "$@")
+
+  _require_arg "--name" "$name"
+  _require_arg "--vpc-id" "$vpc_id"
+
+  local payload="{\"name\":\"${name}\",\"vpcId\":\"${vpc_id}\""
+  [[ -n "$region" ]] && payload="${payload},\"region\":\"${region}\""
+  payload="${payload}}"
+
+  _info "Creating container cluster ${BOLD}${name}${NC} ..."
+  local body
+  body=$(_api_post "/containers/clusters" "$payload")
+  local data
+  data=$(_extract_data "$body")
+
+  _success "Container cluster created."
+  echo ""
+  echo "  ID:   $(echo "$data" | _json_get '.id')"
+  echo "  Name: $(echo "$data" | _json_get '.name')"
+}
+
+container_cluster_get() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  local body
+  body=$(_api_get "/containers/clusters/${id}")
+  _extract_data "$body" | _json_pretty
+}
+
+container_cluster_delete() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  read -rp "Are you sure you want to delete container cluster ${id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting container cluster ${BOLD}${id}${NC} ..."
+  _api_delete "/containers/clusters/${id}" >/dev/null
+  _success "Container cluster ${id} deleted."
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+#                       TASK DEFINITION COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+
+cmd_task_def() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)       task_def_list "$@" ;;
+    create)     task_def_create "$@" ;;
+    get|show)   task_def_get "$@" ;;
+    delete)     task_def_delete "$@" ;;
+    help|*)     task_def_help ;;
+  esac
+}
+
+task_def_help() {
+  cat <<EOF
+${BOLD}Usage:${NC} devskin task-def <subcommand> [options]
+
+${BOLD}Subcommands:${NC}
+  list                              List all task definitions
+  create --family FAMILY --image IMAGE [--cpu CPU] [--memory MEM]
+         [--container-port PORT] [--host-port PORT] [--protocol PROTO]
+                                    Create a new task definition
+  get ID                            Show task definition details
+  delete ID                         Delete a task definition
+EOF
+}
+
+task_def_list() {
+  _require_auth
+  local body
+  body=$(_api_get "/containers/task-definitions")
+  local data
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Task Definitions${NC}"
+  echo ""
+  echo "$data" | _format_table id family status cpu memory
+}
+
+task_def_create() {
+  _require_auth
+  local family image cpu memory container_port host_port protocol
+  family=$(_parse_flag "--family" "$@")
+  image=$(_parse_flag "--image" "$@")
+  cpu=$(_parse_flag "--cpu" "$@")
+  memory=$(_parse_flag "--memory" "$@")
+  container_port=$(_parse_flag "--container-port" "$@")
+  host_port=$(_parse_flag "--host-port" "$@")
+  protocol=$(_parse_flag "--protocol" "$@")
+
+  _require_arg "--family" "$family"
+  _require_arg "--image" "$image"
+
+  local payload="{\"family\":\"${family}\",\"image\":\"${image}\""
+  [[ -n "$cpu" ]]    && payload="${payload},\"cpu\":${cpu}"
+  [[ -n "$memory" ]] && payload="${payload},\"memory\":${memory}"
+  if [[ -n "$container_port" ]]; then
+    local proto="${protocol:-tcp}"
+    local hp="${host_port:-$container_port}"
+    payload="${payload},\"portMappings\":[{\"containerPort\":${container_port},\"hostPort\":${hp},\"protocol\":\"${proto}\"}]"
+  fi
+  payload="${payload}}"
+
+  _info "Creating task definition ${BOLD}${family}${NC} ..."
+  local body
+  body=$(_api_post "/containers/task-definitions" "$payload")
+  local data
+  data=$(_extract_data "$body")
+
+  _success "Task definition created."
+  echo ""
+  echo "  ID:     $(echo "$data" | _json_get '.id')"
+  echo "  Family: $(echo "$data" | _json_get '.family')"
+}
+
+task_def_get() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "TASK_DEF_ID" "$id"
+
+  local body
+  body=$(_api_get "/containers/task-definitions/${id}")
+  _extract_data "$body" | _json_pretty
+}
+
+task_def_delete() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "TASK_DEF_ID" "$id"
+
+  read -rp "Are you sure you want to delete task definition ${id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting task definition ${BOLD}${id}${NC} ..."
+  _api_delete "/containers/task-definitions/${id}" >/dev/null
+  _success "Task definition ${id} deleted."
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -4936,7 +5133,7 @@ ${BOLD}Functions:${NC}
 
 ${BOLD}Kubernetes:${NC}
   k8s list               List clusters
-  k8s create             Create cluster   (--name, --version)
+  k8s create             Create cluster   (--name, --version, [--nodes, --region, --vpc-id])
   k8s get ID             Show cluster details
   k8s delete ID          Delete cluster
 
@@ -4991,6 +5188,18 @@ ${BOLD}Containers (ECS):${NC}
   container delete ID    Delete service
   container deploy ID    Deploy/update service
   container restart ID   Restart service
+
+${BOLD}Container Clusters:${NC}
+  container-cluster list         List container clusters
+  container-cluster create       Create cluster   (--name, --vpc-id)
+  container-cluster get ID       Show cluster details
+  container-cluster delete ID    Delete cluster
+
+${BOLD}Task Definitions:${NC}
+  task-def list          List task definitions
+  task-def create        Create task def  (--family, --image, [--cpu, --memory, --container-port, --host-port, --protocol])
+  task-def get ID        Show task definition details
+  task-def delete ID     Delete task definition
 
 ${BOLD}CI/CD:${NC}
   cicd pipelines list    List pipelines
@@ -5203,6 +5412,8 @@ main() {
 
     # New service commands
     container|containers|ecs)    cmd_container "$@" ;;
+    container-cluster)           cmd_container_cluster "$@" ;;
+    task-def|task-definition)    cmd_task_def "$@" ;;
     cicd|pipeline|pipelines)     cmd_cicd "$@" ;;
     git|gitea)                   cmd_git "$@" ;;
     sqs|queue|queues)            cmd_sqs "$@" ;;
