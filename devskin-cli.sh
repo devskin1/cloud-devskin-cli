@@ -2993,7 +2993,10 @@ ${BOLD}Usage:${NC} devskin container <subcommand> [options]
 
 ${BOLD}Subcommands:${NC}
   list                              List all container services
-  create --name NAME --image IMAGE [--cpu CPU] [--memory MEM] [--replicas N]
+  create --name NAME --image IMAGE --cluster-id ID --task-def-id ID --port PORT
+         [--cpu CPU] [--memory MEM] [--replicas N] [--env KEY=VALUE ...]
+         [--source-repo REPO] [--source-branch BRANCH]
+         [--endpoint-mode direct|loadbalancer] [--lb-id ID]
                                     Create a new container service
   get ID                            Show container service details
   delete ID                         Delete a container service
@@ -3012,25 +3015,59 @@ container_list() {
 
   echo -e "${BOLD}Container Services${NC}"
   echo ""
-  echo "$data" | _format_table id name status cpu memory replicas
+  echo "$data" | _format_table id name status publicIp port runningCount desiredCount image
 }
 
 container_create() {
   _require_auth
-  local name image cpu memory replicas
+  local name image cpu memory replicas cluster_id task_def_id port
+  local source_repo source_branch endpoint_mode lb_id
   name=$(_parse_flag "--name" "$@")
   image=$(_parse_flag "--image" "$@")
   cpu=$(_parse_flag "--cpu" "$@")
   memory=$(_parse_flag "--memory" "$@")
   replicas=$(_parse_flag "--replicas" "$@")
+  cluster_id=$(_parse_flag "--cluster-id" "$@")
+  task_def_id=$(_parse_flag "--task-def-id" "$@")
+  port=$(_parse_flag "--port" "$@")
+  source_repo=$(_parse_flag "--source-repo" "$@")
+  source_branch=$(_parse_flag "--source-branch" "$@")
+  endpoint_mode=$(_parse_flag "--endpoint-mode" "$@")
+  lb_id=$(_parse_flag "--lb-id" "$@")
 
   _require_arg "--name" "$name"
-  _require_arg "--image" "$image"
+  _require_arg "--cluster-id" "$cluster_id"
+  _require_arg "--task-def-id" "$task_def_id"
+  _require_arg "--port" "$port"
 
-  local payload="{\"name\":\"${name}\",\"image\":\"${image}\""
-  [[ -n "$cpu" ]]      && payload="${payload},\"cpu\":${cpu}"
-  [[ -n "$memory" ]]   && payload="${payload},\"memory\":${memory}"
-  [[ -n "$replicas" ]] && payload="${payload},\"replicas\":${replicas}"
+  [[ -z "$image" ]] && image="auto"
+
+  local payload="{\"name\":\"${name}\",\"image\":\"${image}\",\"clusterId\":\"${cluster_id}\",\"taskDefinitionId\":\"${task_def_id}\",\"port\":${port},\"instanceType\":\"ecs.medium\""
+  [[ -n "$cpu" ]]           && payload="${payload},\"cpu\":${cpu}"
+  [[ -n "$memory" ]]        && payload="${payload},\"memory\":${memory}"
+  [[ -n "$replicas" ]]      && payload="${payload},\"desiredCount\":${replicas}"
+  [[ -n "$source_repo" ]]   && payload="${payload},\"sourceRepository\":\"${source_repo}\""
+  [[ -n "$source_branch" ]] && payload="${payload},\"sourceBranch\":\"${source_branch}\""
+  [[ -n "$endpoint_mode" ]] && payload="${payload},\"endpointMode\":\"${endpoint_mode}\""
+  [[ -n "$lb_id" ]]         && payload="${payload},\"loadBalancerId\":\"${lb_id}\""
+
+  # Parse --env flags (multiple allowed)
+  local env_json="{"
+  local env_count=0
+  local prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--env" ]] && [[ "$arg" == *"="* ]]; then
+      local key="${arg%%=*}"
+      local val="${arg#*=}"
+      [[ $env_count -gt 0 ]] && env_json="${env_json},"
+      env_json="${env_json}\"${key}\":\"${val}\""
+      env_count=$((env_count + 1))
+    fi
+    prev="$arg"
+  done
+  env_json="${env_json}}"
+  [[ $env_count -gt 0 ]] && payload="${payload},\"environment\":${env_json}"
+
   payload="${payload}}"
 
   _info "Creating container service ${BOLD}${name}${NC} ..."
@@ -3041,8 +3078,10 @@ container_create() {
 
   _success "Container service created."
   echo ""
-  echo "  ID:   $(echo "$data" | _json_get '.id')"
-  echo "  Name: $(echo "$data" | _json_get '.name')"
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Status:   $(echo "$data" | _json_get '.status')"
+  echo "  PublicIP: $(echo "$data" | _json_get '.publicIp')"
 }
 
 container_get() {
