@@ -1049,6 +1049,10 @@ ${BOLD}Subcommands:${NC}
   allocate                          Allocate a new elastic IP
   release ID                        Release an elastic IP
   associate IP_ID INSTANCE_ID       Associate an elastic IP with an instance
+  associate IP_ID --cluster ID --node NAME
+                                    OR associate to a Kubernetes node
+                                    (master-XXX or worker-YYY from cluster.tags.vmIps).
+                                    Auto-opens 80/443/30080/30443 on pfSense.
   disassociate IP_ID                Disassociate an elastic IP
 EOF
 }
@@ -1092,12 +1096,28 @@ eip_release() {
 eip_associate() {
   _require_auth
   local ip_id="${1:-}"
-  local instance_id="${2:-}"
+  shift || true
   _require_arg "ELASTIC_IP_ID" "$ip_id"
-  _require_arg "INSTANCE_ID" "$instance_id"
 
-  _info "Associating elastic IP ${BOLD}${ip_id}${NC} with instance ${BOLD}${instance_id}${NC} ..."
-  _api_post "/networking/elastic-ips/${ip_id}/associate" "{\"instanceId\":\"${instance_id}\"}" >/dev/null
+  # Either: instance_id positional OR --cluster + --node flags for K8s nodes
+  local instance_id="${1:-}"
+  local cluster_id node_name
+  cluster_id=$(_parse_flag "--cluster" "$@")
+  node_name=$(_parse_flag "--node" "$@")
+
+  local payload
+  if [[ -n "$cluster_id" && -n "$node_name" ]]; then
+    _info "Associating elastic IP ${BOLD}${ip_id}${NC} with K8s node ${BOLD}${cluster_id}/${node_name}${NC} ..."
+    payload="{\"kubernetesClusterId\":\"${cluster_id}\",\"nodeName\":\"${node_name}\"}"
+  elif [[ -n "$instance_id" && "$instance_id" != --* ]]; then
+    _info "Associating elastic IP ${BOLD}${ip_id}${NC} with instance ${BOLD}${instance_id}${NC} ..."
+    payload="{\"instanceId\":\"${instance_id}\"}"
+  else
+    _err "Provide either INSTANCE_ID or --cluster CLUSTER_ID --node NODE_NAME"
+    return 1
+  fi
+
+  _api_post "/networking/elastic-ips/${ip_id}/associate" "$payload" >/dev/null
   _success "Elastic IP associated."
 }
 
@@ -1251,6 +1271,7 @@ cmd_k8s() {
     list)       k8s_list "$@" ;;
     create)     k8s_create "$@" ;;
     get|show)   k8s_get "$@" ;;
+    oidc)       k8s_oidc "$@" ;;
     delete)     k8s_delete "$@" ;;
     help|*)     k8s_help ;;
   esac
@@ -1262,9 +1283,15 @@ ${BOLD}Usage:${NC} devskin k8s <subcommand> [options]
 
 ${BOLD}Subcommands:${NC}
   list                              List all Kubernetes clusters
-  create --name NAME --version VERSION [--nodes COUNT] [--region REGION] [--vpc-id VPC_ID]
+  create --name NAME --version VERSION [--nodes N] [--region R] [--vpc-id ID]
+         [--max-pods N]             Max pods per node (default 110)
+         [--cni calico|flannel]     Default calico
+         [--addons LIST]            Comma-separated: metrics-server,ingress-nginx,
+                                    cert-manager,kyverno,cilium,longhorn,velero,
+                                    irsa,local-path  (defaults: metrics+local-path+irsa)
                                     Create a new cluster
   get ID                            Show cluster details
+  oidc ID                           Show the cluster's OIDC issuer + JWKS URL (for IRSA setup)
   delete ID                         Delete a cluster
 EOF
 }
@@ -1283,20 +1310,45 @@ k8s_list() {
 
 k8s_create() {
   _require_auth
-  local name version nodes region vpc_id
+  local name version nodes region vpc_id max_pods cni addons
   name=$(_parse_flag "--name" "$@")
   version=$(_parse_flag "--version" "$@")
   nodes=$(_parse_flag "--nodes" "$@")
   region=$(_parse_flag "--region" "$@")
   vpc_id=$(_parse_flag "--vpc-id" "$@")
+  max_pods=$(_parse_flag "--max-pods" "$@")
+  cni=$(_parse_flag "--cni" "$@")
+  addons=$(_parse_flag "--addons" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--version" "$version"
 
   local payload="{\"name\":\"${name}\",\"version\":\"${version}\""
-  [[ -n "$nodes" ]]  && payload="${payload},\"nodeCount\":${nodes}"
-  [[ -n "$region" ]] && payload="${payload},\"region\":\"${region}\""
-  [[ -n "$vpc_id" ]] && payload="${payload},\"vpcId\":\"${vpc_id}\""
+  [[ -n "$nodes" ]]    && payload="${payload},\"nodeCount\":${nodes}"
+  [[ -n "$region" ]]   && payload="${payload},\"region\":\"${region}\""
+  [[ -n "$vpc_id" ]]   && payload="${payload},\"vpcId\":\"${vpc_id}\""
+  [[ -n "$max_pods" ]] && payload="${payload},\"maxPods\":${max_pods}"
+  [[ -n "$cni" ]]      && payload="${payload},\"cni\":\"${cni}\""
+
+  if [[ -n "$addons" ]]; then
+    # Build addons object from comma-separated list
+    # CLI alias → backend field name
+    local addon_map='{"metrics-server":"metricsServer","ingress-nginx":"ingressNginx","cert-manager":"certManager","kyverno":"kyverno","cilium":"cilium","longhorn":"longhorn","velero":"velero","irsa":"irsa","local-path":"localPathStorage"}'
+    local addons_json="{"
+    local first=1
+    IFS=',' read -ra ADDR <<< "$addons"
+    for a in "${ADDR[@]}"; do
+      a=$(echo "$a" | tr -d '[:space:]')
+      local key
+      key=$(echo "$addon_map" | _json_get ".[\"$a\"]")
+      [[ -z "$key" || "$key" == "null" ]] && key="$a"
+      [[ $first -eq 0 ]] && addons_json="${addons_json},"
+      addons_json="${addons_json}\"${key}\":true"
+      first=0
+    done
+    addons_json="${addons_json}}"
+    payload="${payload},\"addons\":${addons_json}"
+  fi
   payload="${payload}}"
 
   _info "Creating Kubernetes cluster ${BOLD}${name}${NC} ..."
@@ -1310,6 +1362,33 @@ k8s_create() {
   echo "  ID:      $(echo "$data" | _json_get '.id')"
   echo "  Name:    $(echo "$data" | _json_get '.name')"
   echo "  Version: $(echo "$data" | _json_get '.version')"
+}
+
+k8s_oidc() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+  local body
+  body=$(_api_get "/oidc/cluster/${id}/.well-known/openid-configuration") || true
+  if [[ -z "$body" ]]; then
+    _err "Cluster ${id} has no OIDC keys (IRSA not enabled or still provisioning)."
+    return 1
+  fi
+  echo -e "${BOLD}OIDC issuer info — cluster ${id}${NC}"
+  echo ""
+  echo "  Issuer:    $(echo "$body" | _json_get '.issuer')"
+  echo "  JWKS URL:  $(echo "$body" | _json_get '.jwks_uri')"
+  echo "  Audience:  sts.kubmix.cloud   (use this in your projected SA token)"
+  echo ""
+  echo "Pod manifest snippet:"
+  cat <<'EOF'
+  serviceAccountName: <your-sa>
+  volumes:
+  - name: aws-iam-token
+    projected:
+      sources:
+      - serviceAccountToken: { audience: sts.kubmix.cloud, expirationSeconds: 3600, path: token }
+EOF
 }
 
 k8s_get() {
@@ -2499,7 +2578,11 @@ ${BOLD}Subcommands:${NC}
   groups create --name NAME         Create an IAM group
   groups delete ID                  Delete an IAM group
   roles list                        List IAM roles
-  roles create --name NAME          Create an IAM role
+  roles create --name NAME [--description TEXT] [--policies LIST]
+                [--trust-cluster CLUSTER --trust-namespace NS --trust-sa SA]
+                                    Create an IAM role. --policies is a comma-list
+                                    (e.g. "s3:GetObject,s3:ListBucket"). The trust
+                                    flags enable IRSA from a K8s ServiceAccount.
   roles delete ID                   Delete an IAM role
   policies list                     List IAM policies
   policies create --name NAME       Create an IAM policy
@@ -2599,11 +2682,40 @@ iam_roles() {
       ;;
     create)
       _require_auth
-      local name
+      local name desc policies trust_cluster trust_ns trust_sa
       name=$(_parse_flag "--name" "$@")
+      desc=$(_parse_flag "--description" "$@")
+      policies=$(_parse_flag "--policies" "$@")
+      trust_cluster=$(_parse_flag "--trust-cluster" "$@")
+      trust_ns=$(_parse_flag "--trust-namespace" "$@")
+      trust_sa=$(_parse_flag "--trust-sa" "$@")
       _require_arg "--name" "$name"
+
+      local payload="{\"name\":\"${name}\""
+      [[ -n "$desc" ]] && payload="${payload},\"description\":\"${desc}\""
+
+      # --policies "s3:GetObject,s3:ListBucket"  → JSON array
+      if [[ -n "$policies" ]]; then
+        local arr="["; local first=1
+        IFS=',' read -ra PARR <<< "$policies"
+        for p in "${PARR[@]}"; do
+          p=$(echo "$p" | tr -d '[:space:]')
+          [[ $first -eq 0 ]] && arr="${arr},"
+          arr="${arr}\"${p}\""
+          first=0
+        done
+        arr="${arr}]"
+        payload="${payload},\"policies\":${arr}"
+      fi
+
+      # IRSA trust policy: only when all three flags provided. Use --trust-sa '*' for any SA.
+      if [[ -n "$trust_cluster" && -n "$trust_ns" && -n "$trust_sa" ]]; then
+        payload="${payload},\"trustPolicy\":{\"kubernetes\":[{\"clusterId\":\"${trust_cluster}\",\"namespace\":\"${trust_ns}\",\"serviceAccountName\":\"${trust_sa}\"}]}"
+      fi
+      payload="${payload}}"
+
       _info "Creating IAM role ${BOLD}${name}${NC} ..."
-      _api_post "/iam/roles" "{\"name\":\"${name}\"}" >/dev/null
+      _api_post "/iam/roles" "$payload" >/dev/null
       _success "IAM role created."
       ;;
     delete)
@@ -5078,6 +5190,270 @@ _check_output_format() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+#                         FLEX COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+
+cmd_flex() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)       flex_list "$@" ;;
+    create)     flex_create "$@" ;;
+    deploy)     flex_deploy "$@" ;;
+    logs)       flex_logs "$@" ;;
+    scale)      flex_scale "$@" ;;
+    delete)     flex_delete "$@" ;;
+    info|get|show) flex_info "$@" ;;
+    env)        flex_env "$@" ;;
+    help|*)     flex_help ;;
+  esac
+}
+
+flex_help() {
+  cat <<EOF
+${BOLD}Usage:${NC} devskin flex <subcommand> [options]
+
+${BOLD}Subcommands:${NC}
+  list                              List all Flex services
+  create --name NAME --source-type TYPE [--source-repo-url URL] [--source-branch BR] [--source-image IMG] [--port P] [--cpu N] [--memory MB] [--min N] [--max N]
+                                    Create a new Flex service
+  info ID                           Show Flex service details
+  deploy ID [--source-image IMG]    Trigger a new deploy
+  logs ID [--tail 200]              Fetch service logs
+  scale ID --min N --max M [--concurrency K]
+                                    Change scaling limits
+  env ID --set KEY=VALUE [--set ...]
+                                    Update environment variables
+  delete ID                         Delete a Flex service
+EOF
+}
+
+flex_list() {
+  _require_auth
+  local body
+  body=$(_api_get "/flex/services")
+  local data
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Flex Services${NC}"
+  echo ""
+  echo "$data" | _format_table id name status sourceType url minInstances maxInstances
+}
+
+flex_create() {
+  _require_auth
+  local name source_type source_repo_url source_branch source_image port cpu memory min_instances max_instances concurrency
+  name=$(_parse_flag "--name" "$@")
+  source_type=$(_parse_flag "--source-type" "$@")
+  source_repo_url=$(_parse_flag "--source-repo-url" "$@")
+  source_branch=$(_parse_flag "--source-branch" "$@")
+  source_image=$(_parse_flag "--source-image" "$@")
+  port=$(_parse_flag "--port" "$@")
+  cpu=$(_parse_flag "--cpu" "$@")
+  memory=$(_parse_flag "--memory" "$@")
+  min_instances=$(_parse_flag "--min" "$@")
+  max_instances=$(_parse_flag "--max" "$@")
+  concurrency=$(_parse_flag "--concurrency" "$@")
+
+  _require_arg "--name" "$name"
+  _require_arg "--source-type" "$source_type"
+
+  local payload="{\"name\":\"${name}\",\"sourceType\":\"${source_type}\""
+  [[ -n "$source_repo_url" ]] && payload="${payload},\"sourceRepoUrl\":\"${source_repo_url}\""
+  [[ -n "$source_branch" ]]   && payload="${payload},\"sourceBranch\":\"${source_branch}\""
+  [[ -n "$source_image" ]]    && payload="${payload},\"sourceImage\":\"${source_image}\""
+  [[ -n "$port" ]]            && payload="${payload},\"port\":${port}"
+  [[ -n "$cpu" ]]             && payload="${payload},\"cpu\":${cpu}"
+  [[ -n "$memory" ]]          && payload="${payload},\"memory\":${memory}"
+  [[ -n "$min_instances" ]]   && payload="${payload},\"minInstances\":${min_instances}"
+  [[ -n "$max_instances" ]]   && payload="${payload},\"maxInstances\":${max_instances}"
+  [[ -n "$concurrency" ]]     && payload="${payload},\"concurrency\":${concurrency}"
+  payload="${payload}}"
+
+  _info "Creating Flex service ${BOLD}${name}${NC} ..."
+  local body
+  body=$(_api_post "/flex/services" "$payload")
+  local data
+  data=$(_extract_data "$body")
+
+  _success "Flex service created."
+  echo ""
+  echo "  ID:     $(echo "$data" | _json_get '.id')"
+  echo "  Name:   $(echo "$data" | _json_get '.name')"
+  echo "  Status: $(echo "$data" | _json_get '.status')"
+  echo "  URL:    $(echo "$data" | _json_get '.url')"
+}
+
+flex_info() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+
+  local body
+  body=$(_api_get "/flex/services/${id}")
+  local data
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Flex Service Details${NC}"
+  echo ""
+  echo "  ID:               $(echo "$data" | _json_get '.id')"
+  echo "  Name:             $(echo "$data" | _json_get '.name')"
+  echo "  Status:           $(echo "$data" | _json_get '.status')"
+  echo "  Region:           $(echo "$data" | _json_get '.region')"
+  echo "  URL:              $(echo "$data" | _json_get '.url')"
+  echo "  Source Type:      $(echo "$data" | _json_get '.sourceType')"
+  echo "  Source Repo:      $(echo "$data" | _json_get '.sourceRepoUrl')"
+  echo "  Source Branch:    $(echo "$data" | _json_get '.sourceBranch')"
+  echo "  Source Image:     $(echo "$data" | _json_get '.sourceImage')"
+  echo "  Port:             $(echo "$data" | _json_get '.port')"
+  echo "  CPU:              $(echo "$data" | _json_get '.cpu')"
+  echo "  Memory (MB):      $(echo "$data" | _json_get '.memory')"
+  echo "  Min Instances:    $(echo "$data" | _json_get '.minInstances')"
+  echo "  Max Instances:    $(echo "$data" | _json_get '.maxInstances')"
+  echo "  Concurrency:      $(echo "$data" | _json_get '.concurrency')"
+  echo "  Autoscaling:      $(echo "$data" | _json_get '.autoscalingEnabled')"
+  echo "  Service Mode:     $(echo "$data" | _json_get '.serviceMode')"
+  echo "  Created:          $(echo "$data" | _json_get '.createdAt')"
+}
+
+flex_deploy() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+  shift 2>/dev/null || true
+
+  local source_image source_type source_repo_url
+  source_image=$(_parse_flag "--source-image" "$@")
+  source_type=$(_parse_flag "--source-type" "$@")
+  source_repo_url=$(_parse_flag "--source-repo-url" "$@")
+
+  local payload="{"
+  local first=1
+  if [[ -n "$source_type" ]]; then
+    payload="${payload}\"sourceType\":\"${source_type}\""
+    first=0
+  fi
+  if [[ -n "$source_repo_url" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"sourceRepoUrl\":\"${source_repo_url}\""
+    first=0
+  fi
+  if [[ -n "$source_image" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"sourceImage\":\"${source_image}\""
+    first=0
+  fi
+  payload="${payload}}"
+
+  _info "Triggering deploy for Flex service ${BOLD}${id}${NC} ..."
+  local body
+  body=$(_api_post "/flex/services/${id}/deploy" "$payload")
+  local data
+  data=$(_extract_data "$body")
+
+  _success "Deploy triggered."
+  echo ""
+  echo "  Status:   $(echo "$data" | _json_get '.status')"
+  echo "  Revision: $(echo "$data" | _json_get '.id')"
+}
+
+flex_logs() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+  shift 2>/dev/null || true
+
+  local tail
+  tail=$(_parse_flag "--tail" "$@")
+  tail="${tail:-200}"
+
+  _info "Fetching logs for Flex service ${BOLD}${id}${NC} (tail=${tail}) ..."
+  local body
+  body=$(_api_get "/flex/services/${id}/logs?tail=${tail}")
+  local data
+  data=$(_extract_data "$body")
+  echo "$data" | _json_pretty
+}
+
+flex_scale() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+  shift 2>/dev/null || true
+
+  local min max concurrency
+  min=$(_parse_flag "--min" "$@")
+  max=$(_parse_flag "--max" "$@")
+  concurrency=$(_parse_flag "--concurrency" "$@")
+
+  _require_arg "--min" "$min"
+  _require_arg "--max" "$max"
+
+  local payload="{\"minInstances\":${min},\"maxInstances\":${max}"
+  [[ -n "$concurrency" ]] && payload="${payload},\"concurrency\":${concurrency}"
+  payload="${payload}}"
+
+  _info "Scaling Flex service ${BOLD}${id}${NC} (min=${min}, max=${max}) ..."
+  _api_patch "/flex/services/${id}/scale" "$payload" >/dev/null
+  _success "Flex service scaled."
+}
+
+flex_env() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+  shift 2>/dev/null || true
+
+  # Collect all --set KEY=VALUE pairs
+  local env_json=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--set" && $# -ge 2 ]]; then
+      local kv="$2"
+      local key="${kv%%=*}"
+      local value="${kv#*=}"
+      if [[ -z "$key" || "$key" == "$kv" ]]; then
+        _fatal "Invalid --set value. Expected KEY=VALUE, got: ${kv}"
+      fi
+      # Escape double quotes and backslashes in value
+      value="${value//\\/\\\\}"
+      value="${value//\"/\\\"}"
+      if [[ -n "$env_json" ]]; then
+        env_json="${env_json},"
+      fi
+      env_json="${env_json}\"${key}\":\"${value}\""
+      shift 2
+    else
+      shift
+    fi
+  done
+
+  if [[ -z "$env_json" ]]; then
+    _fatal "No environment variables provided. Use ${BOLD}--set KEY=VALUE${NC} (repeatable)."
+  fi
+
+  local payload="{\"envVars\":{${env_json}}}"
+
+  _info "Updating environment variables for Flex service ${BOLD}${id}${NC} ..."
+  _api_patch "/flex/services/${id}/env" "$payload" >/dev/null
+  _success "Flex service environment updated."
+}
+
+flex_delete() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "FLEX_SERVICE_ID" "$id"
+
+  read -rp "Are you sure you want to delete Flex service ${id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting Flex service ${BOLD}${id}${NC} ..."
+  _api_delete "/flex/services/${id}" >/dev/null
+  _success "Flex service ${id} deleted."
+}
+
+# ════════════════════════════════════════════════════════════════════════════
 #                          MAIN HELP
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -5239,6 +5615,16 @@ ${BOLD}Task Definitions:${NC}
   task-def create        Create task def  (--family, --image, [--cpu, --memory, --container-port, --host-port, --protocol])
   task-def get ID        Show task definition details
   task-def delete ID     Delete task definition
+
+${BOLD}Flex (Managed Apps):${NC}
+  flex list              List Flex services
+  flex create            Create Flex service  (--name, --source-type, [--source-repo-url, --source-branch, --source-image, --port, --cpu, --memory, --min, --max])
+  flex info ID           Show Flex service details
+  flex deploy ID         Trigger a new deploy   ([--source-image])
+  flex logs ID           Fetch service logs     ([--tail])
+  flex scale ID          Change scaling limits  (--min, --max, [--concurrency])
+  flex env ID            Update env vars        (--set KEY=VALUE ...)
+  flex delete ID         Delete Flex service
 
 ${BOLD}CI/CD:${NC}
   cicd pipelines list    List pipelines
@@ -5453,6 +5839,7 @@ main() {
     container|containers|ecs)    cmd_container "$@" ;;
     container-cluster)           cmd_container_cluster "$@" ;;
     task-def|task-definition)    cmd_task_def "$@" ;;
+    flex)                        cmd_flex "$@" ;;
     cicd|pipeline|pipelines)     cmd_cicd "$@" ;;
     git|gitea)                   cmd_git "$@" ;;
     sqs|queue|queues)            cmd_sqs "$@" ;;
