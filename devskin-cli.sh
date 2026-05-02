@@ -402,7 +402,9 @@ ${BOLD}Usage:${NC} devskin compute <subcommand> [options]
 ${BOLD}Subcommands:${NC}
   list                              List all instances
   create --name NAME --type TYPE --image IMAGE [--keypair KP] [--vpc VPC] [--subnet SUB] [--sg SG]
-                                    Create a new instance
+         [--monitoring-api-key KEY]
+                                    Create a new instance (set --monitoring-api-key to enroll the
+                                    VM into Flux observability at boot)
   get ID                            Show instance details
   start ID                          Start a stopped instance
   stop ID                           Stop a running instance
@@ -426,7 +428,7 @@ compute_list() {
 
 compute_create() {
   _require_auth
-  local name type image keypair vpc subnet sg
+  local name type image keypair vpc subnet sg monitoring_key
   name=$(_parse_flag "--name" "$@")
   type=$(_parse_flag "--type" "$@")
   image=$(_parse_flag "--image" "$@")
@@ -434,6 +436,7 @@ compute_create() {
   vpc=$(_parse_flag "--vpc" "$@")
   subnet=$(_parse_flag "--subnet" "$@")
   sg=$(_parse_flag "--sg" "$@")
+  monitoring_key=$(_parse_flag "--monitoring-api-key" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--type" "$type"
@@ -444,6 +447,9 @@ compute_create() {
   [[ -n "$vpc" ]]     && payload="${payload},\"vpcId\":\"${vpc}\""
   [[ -n "$subnet" ]]  && payload="${payload},\"subnetId\":\"${subnet}\""
   [[ -n "$sg" ]]      && payload="${payload},\"securityGroupId\":\"${sg}\""
+  if [[ -n "$monitoring_key" ]]; then
+    payload="${payload},\"monitoring\":true,\"monitoringEnrollment\":{\"enabled\":true,\"apiKey\":\"${monitoring_key}\"}"
+  fi
   payload="${payload}}"
 
   _info "Creating instance ${BOLD}${name}${NC} ..."
@@ -510,6 +516,30 @@ compute_get() {
   echo "  Image:             $(echo "$data" | _json_get '.imageId')"
   echo "  Key Pair:          $(echo "$data" | _json_get '.keyPairName')"
   echo "  Created:           $(echo "$data" | _json_get '.createdAt')"
+
+  # Best-effort surface marketplace credentials and protocol hint via /connect.
+  # The endpoint is omitted for plain VMs; ignore failure silently.
+  local conn_body conn_data is_proto svc_port login pwd
+  conn_body=$(_api_get "/compute/instances/${id}/connect" 2>/dev/null || true)
+  if [[ -n "$conn_body" ]]; then
+    conn_data=$(_extract_data "$conn_body" 2>/dev/null || true)
+    is_proto=$(echo "$conn_data"  | _json_get '.isProtocolOnly' 2>/dev/null || echo "")
+    svc_port=$(echo "$conn_data"  | _json_get '.servicePort' 2>/dev/null || echo "")
+    login=$(echo "$conn_data"     | _json_get '.marketplace.defaultCredentials.username' 2>/dev/null || echo "")
+    pwd=$(echo "$conn_data"       | _json_get '.marketplace.defaultCredentials.password' 2>/dev/null || echo "")
+    if [[ -n "$svc_port" && "$svc_port" != "null" ]]; then
+      echo ""
+      echo -e "${BOLD}Service${NC}"
+      echo "  Port:              ${svc_port}"
+      [[ "$is_proto" == "true" ]] && echo "  Protocol-only:     yes (no HTTP login page — connect with the service client)"
+      if [[ -n "$login" && "$login" != "null" ]]; then
+        echo "  App username:      ${login}"
+      fi
+      if [[ -n "$pwd" && "$pwd" != "null" ]]; then
+        echo "  App password:      ${pwd}"
+      fi
+    fi
+  fi
 }
 
 compute_ssh() {
@@ -1268,12 +1298,21 @@ fn_delete() {
 cmd_k8s() {
   local sub="${1:-help}"; shift 2>/dev/null || true
   case "$sub" in
-    list)       k8s_list "$@" ;;
-    create)     k8s_create "$@" ;;
-    get|show)   k8s_get "$@" ;;
-    oidc)       k8s_oidc "$@" ;;
-    delete)     k8s_delete "$@" ;;
-    help|*)     k8s_help ;;
+    list)             k8s_list "$@" ;;
+    create)           k8s_create "$@" ;;
+    update)           k8s_update "$@" ;;
+    get|show)         k8s_get "$@" ;;
+    oidc)             k8s_oidc "$@" ;;
+    autoscaler)       k8s_autoscaler "$@" ;;
+    autoheal)         k8s_autoheal "$@" ;;
+    namespace-costs)  k8s_namespace_costs "$@" ;;
+    delete)           k8s_delete "$@" ;;
+    backups)          k8s_backups_list "$@" ;;
+    backup)           k8s_backup_create "$@" ;;
+    backup-download)  k8s_backup_download "$@" ;;
+    backup-delete)    k8s_backup_delete "$@" ;;
+    optimize)         k8s_optimize "$@" ;;
+    help|*)           k8s_help ;;
   esac
 }
 
@@ -1289,10 +1328,56 @@ ${BOLD}Subcommands:${NC}
          [--addons LIST]            Comma-separated: metrics-server,ingress-nginx,
                                     cert-manager,kyverno,cilium,longhorn,velero,
                                     irsa,local-path  (defaults: metrics+local-path+irsa)
+         [--ha]                     HA control plane (3 masters, ~R\$100-150/month extra)
+         [--backup-bucket ID]       S3 bucket id for etcd backups
+         [--backup-retention N]     Retention days, 1-90 (default 7)
+         [--allowed-cidrs LIST]     Comma-separated CIDRs allowed to reach the API
+                                    (default 0.0.0.0/0)
+         [--default-deny-netpol]    Install default-deny NetworkPolicy addon
+         [--autoscaler]             Enable Cluster Autoscaler (Proxmox-aware)
+         [--autoscaler-min N]       Min worker nodes when autoscaler enabled (default 1)
+         [--autoscaler-max N]       Max worker nodes cap (default 10)
+         [--no-autoheal]            Disable Node Auto-Heal (default ENABLED). Auto-heal
+                                    replaces dead workers (kubelet down/VM crashed) with
+                                    fresh VMs automatically.
                                     Create a new cluster
+  update ID [--backup-bucket ID] [--backup-retention N] [--allowed-cidrs LIST]
+            [--addon=NAME=BOOL] [--autoscaler] [--no-autoscaler]
+            [--autoscaler-min N] [--autoscaler-max N]
+            [--autoheal] [--no-autoheal]
+                                    Edit cluster post-creation (at least one flag required).
+                                    --addon may repeat; NAME matches create's --addons keys.
   get ID                            Show cluster details
   oidc ID                           Show the cluster's OIDC issuer + JWKS URL (for IRSA setup)
+  autoscaler ID                     Show Cluster Autoscaler status + recent scale events
+  autoheal ID                       Show Node Auto-Heal recent replacements
+  namespace-costs ID|--all          Per-namespace K8s cost attribution (CPU·h, RAM GB·h,
+                                    pods, USD) over a chosen period.
+            [--from ISO]            Period start (default: 30 days ago)
+            [--to   ISO]            Period end   (default: now)
+            [--group-by namespace|label]  Group rows (default namespace)
+            [--label-key KEY]       Required when --group-by=label
+            [--export-csv FILE]     Also write the rows to a CSV file
+            --all                   Aggregate across every cluster in the org
   delete ID                         Delete a cluster
+  backups ID                        List etcd backups for the cluster
+  backup ID                         Trigger a manual backup snapshot
+  backup-download ID BACKUP_ID [--save PATH]
+                                    Get presigned URL (or download to PATH)
+  backup-delete ID BACKUP_ID        Delete a backup (asks for confirmation)
+
+${BOLD}Optimization (KubeTurbo-equivalent recommendations):${NC}
+  optimize list [--cluster ID] [--status NEW|APPLIED|DISMISSED|EXPIRED]
+                [--type rightsizing|binpack] [--sort savings|confidence|newest]
+                                    List cluster optimization recommendations
+  optimize show ID                  Show recommendation detail (incl. metrics snapshot)
+  optimize apply ID                 Apply a recommendation — MODIFIES the cluster
+                                    (rightsizing patches the Deployment;
+                                     bin-packing drains the target node).
+                                    Asks for confirmation.
+  optimize dismiss ID               Dismiss without applying
+  optimize savings [--cluster ID]   Aggregated potential + applied savings
+  optimize scan                     Admin: trigger a fresh analyzer pass
 EOF
 }
 
@@ -1308,9 +1393,54 @@ k8s_list() {
   echo "$data" | _format_table id name version status nodeCount region
 }
 
+_has_bool_flag() {
+  # Usage: _has_bool_flag "--ha" "$@"  → echoes 1 if flag present, 0 otherwise.
+  local flag="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" ]]; then echo 1; return 0; fi
+    shift
+  done
+  echo 0
+}
+
+# Map CLI addon alias → backend addon key (shared between create + update).
+_k8s_addon_key() {
+  local a="$1"
+  case "$a" in
+    metrics-server)    echo "metricsServer" ;;
+    ingress-nginx)     echo "ingressNginx" ;;
+    cert-manager)      echo "certManager" ;;
+    local-path)        echo "localPathStorage" ;;
+    default-deny-netpol|defaultDenyNetpol)
+                       echo "defaultDenyNetpol" ;;
+    *)                 echo "$a" ;;
+  esac
+}
+
+# Build a JSON array literal from a comma-separated list.
+# Echoes e.g.  ["10.0.0.0/8","192.168.0.0/16"]
+_csv_to_json_array() {
+  local csv="$1"
+  local out="["
+  local first=1
+  IFS=',' read -ra ITEMS <<< "$csv"
+  for item in "${ITEMS[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [[ -z "$item" ]] && continue
+    [[ $first -eq 0 ]] && out="${out},"
+    out="${out}\"${item}\""
+    first=0
+  done
+  out="${out}]"
+  echo "$out"
+}
+
 k8s_create() {
   _require_auth
   local name version nodes region vpc_id max_pods cni addons
+  local backup_bucket backup_retention allowed_cidrs ha default_deny_netpol
+  local autoscaler autoscaler_min autoscaler_max
   name=$(_parse_flag "--name" "$@")
   version=$(_parse_flag "--version" "$@")
   nodes=$(_parse_flag "--nodes" "$@")
@@ -1319,33 +1449,81 @@ k8s_create() {
   max_pods=$(_parse_flag "--max-pods" "$@")
   cni=$(_parse_flag "--cni" "$@")
   addons=$(_parse_flag "--addons" "$@")
+  backup_bucket=$(_parse_flag "--backup-bucket" "$@")
+  backup_retention=$(_parse_flag "--backup-retention" "$@")
+  allowed_cidrs=$(_parse_flag "--allowed-cidrs" "$@")
+  ha=$(_has_bool_flag "--ha" "$@")
+  default_deny_netpol=$(_has_bool_flag "--default-deny-netpol" "$@")
+  autoscaler=$(_has_bool_flag "--autoscaler" "$@")
+  autoscaler_min=$(_parse_flag "--autoscaler-min" "$@")
+  autoscaler_max=$(_parse_flag "--autoscaler-max" "$@")
+  local no_autoheal
+  no_autoheal=$(_has_bool_flag "--no-autoheal" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--version" "$version"
 
-  local payload="{\"name\":\"${name}\",\"version\":\"${version}\""
-  [[ -n "$nodes" ]]    && payload="${payload},\"nodeCount\":${nodes}"
-  [[ -n "$region" ]]   && payload="${payload},\"region\":\"${region}\""
-  [[ -n "$vpc_id" ]]   && payload="${payload},\"vpcId\":\"${vpc_id}\""
-  [[ -n "$max_pods" ]] && payload="${payload},\"maxPods\":${max_pods}"
-  [[ -n "$cni" ]]      && payload="${payload},\"cni\":\"${cni}\""
+  if [[ -n "$backup_retention" ]]; then
+    if ! [[ "$backup_retention" =~ ^[0-9]+$ ]] || [[ "$backup_retention" -lt 1 ]] || [[ "$backup_retention" -gt 90 ]]; then
+      _fatal "--backup-retention must be an integer between 1 and 90."
+    fi
+  fi
 
+  if [[ -n "$autoscaler_min" ]] && ! [[ "$autoscaler_min" =~ ^[0-9]+$ ]]; then
+    _fatal "--autoscaler-min must be a non-negative integer."
+  fi
+  if [[ -n "$autoscaler_max" ]] && ! [[ "$autoscaler_max" =~ ^[0-9]+$ ]]; then
+    _fatal "--autoscaler-max must be a non-negative integer."
+  fi
+
+  if [[ "$ha" == "1" ]]; then
+    _warn "WARNING: HA cluster uses 3 masters (~R\$100-150/month extra). Cannot be undone after creation."
+    read -rp "Continue creating HA cluster ${name}? [y/N] " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+      echo "Aborted."
+      return
+    fi
+  fi
+
+  local payload="{\"name\":\"${name}\",\"version\":\"${version}\""
+  [[ -n "$nodes" ]]            && payload="${payload},\"nodeCount\":${nodes}"
+  [[ -n "$region" ]]           && payload="${payload},\"region\":\"${region}\""
+  [[ -n "$vpc_id" ]]           && payload="${payload},\"vpcId\":\"${vpc_id}\""
+  [[ -n "$max_pods" ]]         && payload="${payload},\"maxPods\":${max_pods}"
+  [[ -n "$cni" ]]              && payload="${payload},\"cni\":\"${cni}\""
+  [[ "$ha" == "1" ]]           && payload="${payload},\"haControlPlane\":true"
+  [[ -n "$backup_bucket" ]]    && payload="${payload},\"backupBucketId\":\"${backup_bucket}\""
+  [[ -n "$backup_retention" ]] && payload="${payload},\"backupRetention\":${backup_retention}"
+  if [[ -n "$allowed_cidrs" ]]; then
+    payload="${payload},\"allowedSourceCidrs\":$(_csv_to_json_array "$allowed_cidrs")"
+  fi
+  [[ "$autoscaler" == "1" ]]    && payload="${payload},\"autoscalerEnabled\":true"
+  [[ -n "$autoscaler_min" ]]    && payload="${payload},\"autoscalerMinNodes\":${autoscaler_min}"
+  [[ -n "$autoscaler_max" ]]    && payload="${payload},\"autoscalerMaxNodes\":${autoscaler_max}"
+  [[ "$no_autoheal" == "1" ]]   && payload="${payload},\"autohealEnabled\":false"
+
+  # Build addons object from --addons list + boolean toggles.
+  local addons_json="" addons_first=1
   if [[ -n "$addons" ]]; then
-    # Build addons object from comma-separated list
-    # CLI alias → backend field name
-    local addon_map='{"metrics-server":"metricsServer","ingress-nginx":"ingressNginx","cert-manager":"certManager","kyverno":"kyverno","cilium":"cilium","longhorn":"longhorn","velero":"velero","irsa":"irsa","local-path":"localPathStorage"}'
-    local addons_json="{"
-    local first=1
+    addons_json="{"
     IFS=',' read -ra ADDR <<< "$addons"
     for a in "${ADDR[@]}"; do
       a=$(echo "$a" | tr -d '[:space:]')
+      [[ -z "$a" ]] && continue
       local key
-      key=$(echo "$addon_map" | _json_get ".[\"$a\"]")
-      [[ -z "$key" || "$key" == "null" ]] && key="$a"
-      [[ $first -eq 0 ]] && addons_json="${addons_json},"
+      key=$(_k8s_addon_key "$a")
+      [[ $addons_first -eq 0 ]] && addons_json="${addons_json},"
       addons_json="${addons_json}\"${key}\":true"
-      first=0
+      addons_first=0
     done
+  fi
+  if [[ "$default_deny_netpol" == "1" ]]; then
+    [[ -z "$addons_json" ]] && addons_json="{"
+    [[ $addons_first -eq 0 ]] && addons_json="${addons_json},"
+    addons_json="${addons_json}\"defaultDenyNetpol\":true"
+    addons_first=0
+  fi
+  if [[ -n "$addons_json" ]]; then
     addons_json="${addons_json}}"
     payload="${payload},\"addons\":${addons_json}"
   fi
@@ -1362,6 +1540,120 @@ k8s_create() {
   echo "  ID:      $(echo "$data" | _json_get '.id')"
   echo "  Name:    $(echo "$data" | _json_get '.name')"
   echo "  Version: $(echo "$data" | _json_get '.version')"
+}
+
+k8s_update() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+  shift || true
+
+  local backup_bucket backup_retention allowed_cidrs
+  local autoscaler_on autoscaler_off autoscaler_min autoscaler_max
+  local autoheal_on autoheal_off
+  backup_bucket=$(_parse_flag "--backup-bucket" "$@")
+  backup_retention=$(_parse_flag "--backup-retention" "$@")
+  allowed_cidrs=$(_parse_flag "--allowed-cidrs" "$@")
+  autoscaler_on=$(_has_bool_flag "--autoscaler" "$@")
+  autoscaler_off=$(_has_bool_flag "--no-autoscaler" "$@")
+  autoscaler_min=$(_parse_flag "--autoscaler-min" "$@")
+  autoscaler_max=$(_parse_flag "--autoscaler-max" "$@")
+  autoheal_on=$(_has_bool_flag "--autoheal" "$@")
+  autoheal_off=$(_has_bool_flag "--no-autoheal" "$@")
+
+  if [[ "$autoscaler_on" == "1" && "$autoscaler_off" == "1" ]]; then
+    _fatal "Cannot pass both --autoscaler and --no-autoscaler."
+  fi
+  if [[ "$autoheal_on" == "1" && "$autoheal_off" == "1" ]]; then
+    _fatal "Cannot pass both --autoheal and --no-autoheal."
+  fi
+  if [[ -n "$autoscaler_min" ]] && ! [[ "$autoscaler_min" =~ ^[0-9]+$ ]]; then
+    _fatal "--autoscaler-min must be a non-negative integer."
+  fi
+  if [[ -n "$autoscaler_max" ]] && ! [[ "$autoscaler_max" =~ ^[0-9]+$ ]]; then
+    _fatal "--autoscaler-max must be a non-negative integer."
+  fi
+
+  if [[ -n "$backup_retention" ]]; then
+    if ! [[ "$backup_retention" =~ ^[0-9]+$ ]] || [[ "$backup_retention" -lt 1 ]] || [[ "$backup_retention" -gt 90 ]]; then
+      _fatal "--backup-retention must be an integer between 1 and 90."
+    fi
+  fi
+
+  # Collect repeated --addon=NAME=BOOL flags.
+  local addons_json="" addons_first=1
+  for arg in "$@"; do
+    if [[ "$arg" == --addon=* ]]; then
+      local kv="${arg#--addon=}"
+      local aname="${kv%%=*}" aval="${kv#*=}"
+      if [[ "$aname" == "$kv" || -z "$aname" ]]; then
+        _fatal "Invalid --addon syntax: ${arg} (expected --addon=NAME=true|false)"
+      fi
+      case "${aval,,}" in
+        true|1|yes|on)   aval="true" ;;
+        false|0|no|off)  aval="false" ;;
+        *) _fatal "Invalid boolean for --addon=${aname}: ${aval}" ;;
+      esac
+      local key
+      key=$(_k8s_addon_key "$aname")
+      [[ -z "$addons_json" ]] && addons_json="{"
+      [[ $addons_first -eq 0 ]] && addons_json="${addons_json},"
+      addons_json="${addons_json}\"${key}\":${aval}"
+      addons_first=0
+    fi
+  done
+  [[ -n "$addons_json" ]] && addons_json="${addons_json}}"
+
+  if [[ -z "$backup_bucket" && -z "$backup_retention" && -z "$allowed_cidrs" && -z "$addons_json" \
+        && "$autoscaler_on" != "1" && "$autoscaler_off" != "1" \
+        && -z "$autoscaler_min" && -z "$autoscaler_max" \
+        && "$autoheal_on" != "1" && "$autoheal_off" != "1" ]]; then
+    _fatal "At least one flag required: --backup-bucket, --backup-retention, --allowed-cidrs, --addon=NAME=BOOL, --autoscaler/--no-autoscaler, --autoscaler-min, --autoscaler-max, or --autoheal/--no-autoheal"
+  fi
+
+  local payload="{" first=1
+  if [[ -n "$backup_bucket" ]]; then
+    payload="${payload}\"backupBucketId\":\"${backup_bucket}\""; first=0
+  fi
+  if [[ -n "$backup_retention" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"backupRetention\":${backup_retention}"; first=0
+  fi
+  if [[ -n "$allowed_cidrs" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"allowedSourceCidrs\":$(_csv_to_json_array "$allowed_cidrs")"; first=0
+  fi
+  if [[ -n "$addons_json" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"addons\":${addons_json}"; first=0
+  fi
+  if [[ "$autoscaler_on" == "1" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autoscalerEnabled\":true"; first=0
+  elif [[ "$autoscaler_off" == "1" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autoscalerEnabled\":false"; first=0
+  fi
+  if [[ -n "$autoscaler_min" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autoscalerMinNodes\":${autoscaler_min}"; first=0
+  fi
+  if [[ -n "$autoscaler_max" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autoscalerMaxNodes\":${autoscaler_max}"; first=0
+  fi
+  if [[ "$autoheal_on" == "1" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autohealEnabled\":true"; first=0
+  elif [[ "$autoheal_off" == "1" ]]; then
+    [[ $first -eq 0 ]] && payload="${payload},"
+    payload="${payload}\"autohealEnabled\":false"; first=0
+  fi
+  payload="${payload}}"
+
+  _info "Updating cluster ${BOLD}${id}${NC} ..."
+  _api_patch "/kubernetes/clusters/${id}" "$payload" >/dev/null
+  _success "Cluster ${id} updated."
 }
 
 k8s_oidc() {
@@ -1389,6 +1681,273 @@ k8s_oidc() {
       sources:
       - serviceAccountToken: { audience: sts.kubmix.cloud, expirationSeconds: 3600, path: token }
 EOF
+}
+
+k8s_autoscaler() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  local body data
+  body=$(_api_get "/kubernetes/clusters/${id}/autoscaler/status")
+  data=$(_extract_data "$body")
+
+  local enabled min_nodes max_nodes current autoscaled last_scale state
+  enabled=$(echo      "$data" | _json_get '.enabled')
+  min_nodes=$(echo    "$data" | _json_get '.minNodes')
+  max_nodes=$(echo    "$data" | _json_get '.maxNodes')
+  current=$(echo      "$data" | _json_get '.currentNodes')
+  autoscaled=$(echo   "$data" | _json_get '.autoscaledNodes')
+  last_scale=$(echo   "$data" | _json_get '.autoscalerLastScaleAt')
+  [[ -z "$last_scale" || "$last_scale" == "null" ]] && last_scale="—"
+
+  if [[ "${enabled,,}" == "true" ]]; then
+    state="ENABLED"
+  else
+    state="DISABLED"
+  fi
+
+  echo -e "${BOLD}Autoscaler:${NC} ${state} (${min_nodes:-?}-${max_nodes:-?} nodes)"
+  echo "Current nodes:    ${current:-?}"
+  echo "Autoscaled nodes: ${autoscaled:-0}"
+  echo "Last scale:       ${last_scale}"
+  echo ""
+  echo -e "${BOLD}Recent events:${NC}"
+
+  local events count i
+  if _has_jq; then
+    events=$(echo "$data" | jq -c '.recentEvents // []' 2>/dev/null || echo "[]")
+    count=$(echo "$events" | jq 'length' 2>/dev/null || echo 0)
+  else
+    events=$(echo "$data" | _json_get '.recentEvents')
+    [[ -z "$events" || "$events" == "null" ]] && events="[]"
+    count=$(echo "$events" | _json_array_len)
+  fi
+  count="${count:-0}"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (no scale events recorded)"
+    return
+  fi
+
+  i=0
+  while [[ $i -lt $count ]]; do
+    local kind delta reason at arrow label
+    kind=$(echo   "$events" | _json_get ".[${i}].kind")
+    delta=$(echo  "$events" | _json_get ".[${i}].delta")
+    reason=$(echo "$events" | _json_get ".[${i}].reason")
+    at=$(echo     "$events" | _json_get ".[${i}].at")
+    case "${kind,,}" in
+      scale-up|up|scaleup)     arrow="↑"; label="scale-up  " ;;
+      scale-down|down|scaledown) arrow="↓"; label="scale-down" ;;
+      *)                       arrow="•"; label="${kind:-event}" ;;
+    esac
+    [[ -n "$reason" && "$reason" != "null" ]] || reason="-"
+    [[ -n "$at" && "$at" != "null" ]] || at="-"
+    local delta_str
+    if [[ "$delta" =~ ^-?[0-9]+$ ]]; then
+      delta_str=$(printf "%+d nodes" "$delta")
+    else
+      delta_str="?  nodes"
+    fi
+    printf "  %s %-10s  %-9s  %-30s  %s\n" "$arrow" "$label" "$delta_str" "$reason" "$at"
+    i=$((i+1))
+  done
+}
+
+k8s_autoheal() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  local body data enabled events count i
+  body=$(_api_get "/kubernetes/clusters/${id}/autoheal/events")
+  data=$(_extract_data "$body")
+
+  enabled=$(echo "$data" | _json_get '.enabled')
+  if [[ "${enabled,,}" == "true" ]]; then
+    echo -e "${BOLD}Auto-heal:${NC} ENABLED"
+  else
+    echo -e "${BOLD}Auto-heal:${NC} DISABLED"
+  fi
+  echo ""
+  echo -e "${BOLD}Recent replacements:${NC}"
+
+  if _has_jq; then
+    events=$(echo "$data" | jq -c '.events // []' 2>/dev/null || echo "[]")
+    count=$(echo "$events" | jq 'length' 2>/dev/null || echo 0)
+  else
+    events=$(echo "$data" | _json_get '.events')
+    [[ -z "$events" || "$events" == "null" ]] && events="[]"
+    count=$(echo "$events" | _json_array_len)
+  fi
+  count="${count:-0}"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (no replacements yet — healthy cluster)"
+    return
+  fi
+
+  i=0
+  while [[ $i -lt $count ]]; do
+    local dead_vmid new_vmid reason dead_name at
+    dead_vmid=$(echo "$events" | _json_get ".[${i}].details.deadVmid")
+    new_vmid=$(echo  "$events" | _json_get ".[${i}].details.newVmid")
+    dead_name=$(echo "$events" | _json_get ".[${i}].details.deadNodeName")
+    reason=$(echo    "$events" | _json_get ".[${i}].details.reason")
+    at=$(echo        "$events" | _json_get ".[${i}].createdAt")
+    [[ -z "$reason" || "$reason" == "null" ]] && reason="-"
+    [[ -z "$dead_name" || "$dead_name" == "null" ]] && dead_name="?"
+    printf "  ♥ VM %-6s replaced VM %-6s  %-22s  %s  (%s)\n" \
+      "${new_vmid:-?}" "${dead_vmid:-?}" "$reason" "$at" "$dead_name"
+    i=$((i+1))
+  done
+}
+
+k8s_namespace_costs() {
+  _require_auth
+
+  # First positional arg is either the cluster ID or --all.
+  local id=""
+  local all_clusters=0
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    id="$1"; shift
+  fi
+
+  local from="" to="" group_by="" label_key="" export_csv=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)         all_clusters=1; shift ;;
+      --from)        from="${2:-}"; shift 2 ;;
+      --to)          to="${2:-}"; shift 2 ;;
+      --group-by)    group_by="${2:-}"; shift 2 ;;
+      --label-key)   label_key="${2:-}"; shift 2 ;;
+      --export-csv)  export_csv="${2:-}"; shift 2 ;;
+      *)             _warn "Unknown flag: $1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$id" && $all_clusters -eq 0 ]]; then
+    _fatal "Pass a CLUSTER_ID or --all. See 'devskin k8s' for usage."
+  fi
+  if [[ "$group_by" == "label" && -z "$label_key" ]]; then
+    _fatal "--label-key is required when --group-by=label"
+  fi
+
+  # Build query string
+  local qs=""
+  _append_qs() {
+    local k="$1" v="$2"
+    [[ -z "$v" ]] && return
+    # Minimal URL-encode of common chars; relies on jq if present, else passes through.
+    if [[ -z "$qs" ]]; then qs="?${k}=${v}"; else qs="${qs}&${k}=${v}"; fi
+  }
+  _append_qs "from" "$from"
+  _append_qs "to" "$to"
+  _append_qs "groupBy" "$group_by"
+  _append_qs "labelKey" "$label_key"
+
+  local path
+  if [[ $all_clusters -eq 1 ]]; then
+    path="/kubernetes/namespace-costs${qs}"
+  else
+    path="/kubernetes/clusters/${id}/namespace-costs${qs}"
+  fi
+
+  local body data
+  body=$(_api_get "$path")
+  data=$(_extract_data "$body")
+
+  # Header summary
+  local cluster_name total nscount pfrom pto
+  if [[ $all_clusters -eq 1 ]]; then
+    cluster_name="(all clusters)"
+  else
+    cluster_name=$(_api_get "/kubernetes/clusters/${id}" | _extract_data | _json_get '.name' 2>/dev/null)
+    [[ -z "$cluster_name" || "$cluster_name" == "null" ]] && cluster_name="$id"
+  fi
+  total=$(echo "$data" | _json_get '.summary.totalUsd')
+  nscount=$(echo "$data" | _json_get '.summary.namespaceCount')
+  pfrom=$(echo "$data" | _json_get '.summary.periodFrom')
+  pto=$(echo "$data" | _json_get '.summary.periodTo')
+  [[ -z "$total"   || "$total"   == "null" ]] && total="0"
+  [[ -z "$nscount" || "$nscount" == "null" ]] && nscount="0"
+  [[ -z "$pfrom"   || "$pfrom"   == "null" ]] && pfrom="-"
+  [[ -z "$pto"     || "$pto"     == "null" ]] && pto="-"
+
+  echo -e "${BOLD}Cluster:${NC} ${cluster_name} · ${BOLD}Period:${NC} ${pfrom} → ${pto}"
+  printf "${BOLD}Total:${NC} US\$ %.2f  ${BOLD}Namespaces:${NC} %s\n" "$total" "$nscount"
+  echo ""
+
+  # Sorted rows (cost desc) — let the API order stand if jq is absent.
+  local rows count i
+  if _has_jq; then
+    rows=$(echo "$data" | jq -c '(.rows // []) | sort_by(-(.costUsd // 0))' 2>/dev/null || echo "[]")
+    count=$(echo "$rows" | jq 'length' 2>/dev/null || echo 0)
+  else
+    rows=$(echo "$data" | _json_get '.rows')
+    [[ -z "$rows" || "$rows" == "null" ]] && rows="[]"
+    count=$(echo "$rows" | _json_array_len)
+  fi
+  count="${count:-0}"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (no namespace cost data for this period)"
+    return
+  fi
+
+  printf "  %-22s  %8s  %10s  %5s  %12s  %5s\n" \
+    "NAMESPACE" "CPU·h" "RAM GB·h" "Pods" "Cost (USD)" "%"
+  printf "  %s\n" "------------------------------------------------------------------------------"
+
+  i=0
+  while [[ $i -lt $count ]]; do
+    local key cpu ram pods cost pct
+    key=$(echo  "$rows" | _json_get ".[${i}].key")
+    cpu=$(echo  "$rows" | _json_get ".[${i}].cpuHours")
+    ram=$(echo  "$rows" | _json_get ".[${i}].ramGbHours")
+    pods=$(echo "$rows" | _json_get ".[${i}].podCount")
+    cost=$(echo "$rows" | _json_get ".[${i}].costUsd")
+    pct=$(echo  "$rows" | _json_get ".[${i}].percentage")
+    [[ -z "$key"  || "$key"  == "null" ]] && key="-"
+    [[ -z "$cpu"  || "$cpu"  == "null" ]] && cpu="0"
+    [[ -z "$ram"  || "$ram"  == "null" ]] && ram="0"
+    [[ -z "$pods" || "$pods" == "null" ]] && pods="0"
+    [[ -z "$cost" || "$cost" == "null" ]] && cost="0"
+    [[ -z "$pct"  || "$pct"  == "null" ]] && pct="0"
+    printf "  %-22s  %8.1f  %10.1f  %5s  \$ %9.2f  %4.0f%%\n" \
+      "$key" "$cpu" "$ram" "$pods" "$cost" "$pct"
+    i=$((i+1))
+  done
+
+  # CSV export
+  if [[ -n "$export_csv" ]]; then
+    {
+      echo "key,costUsd,cpuHours,ramGbHours,storageGbMonths,podCount,percentage"
+      if _has_jq; then
+        echo "$rows" | jq -r '.[] | [
+          .key, (.costUsd // 0), (.cpuHours // 0), (.ramGbHours // 0),
+          (.storageGbMonths // 0), (.podCount // 0), (.percentage // 0)
+        ] | @csv'
+      else
+        local j=0
+        while [[ $j -lt $count ]]; do
+          local k_ c_ cpu_ ram_ stor_ pods_ pct_
+          k_=$(echo    "$rows" | _json_get ".[${j}].key")
+          c_=$(echo    "$rows" | _json_get ".[${j}].costUsd")
+          cpu_=$(echo  "$rows" | _json_get ".[${j}].cpuHours")
+          ram_=$(echo  "$rows" | _json_get ".[${j}].ramGbHours")
+          stor_=$(echo "$rows" | _json_get ".[${j}].storageGbMonths")
+          pods_=$(echo "$rows" | _json_get ".[${j}].podCount")
+          pct_=$(echo  "$rows" | _json_get ".[${j}].percentage")
+          printf '"%s",%s,%s,%s,%s,%s,%s\n' \
+            "${k_:-}" "${c_:-0}" "${cpu_:-0}" "${ram_:-0}" "${stor_:-0}" "${pods_:-0}" "${pct_:-0}"
+          j=$((j+1))
+        done
+      fi
+    } > "$export_csv"
+    _info "Wrote $count rows to ${BOLD}${export_csv}${NC}"
+  fi
 }
 
 k8s_get() {
@@ -1428,6 +1987,437 @@ k8s_delete() {
   _info "Deleting cluster ${BOLD}${id}${NC} ..."
   _api_delete "/kubernetes/clusters/${id}" >/dev/null
   _success "Cluster ${id} deleted."
+}
+
+# ── Backups ─────────────────────────────────────────────────────────────────
+_human_bytes() {
+  local b="${1:-0}"
+  if ! [[ "$b" =~ ^[0-9]+$ ]]; then echo "-"; return; fi
+  if   [[ $b -lt 1024 ]];          then echo "${b}B"
+  elif [[ $b -lt 1048576 ]];       then awk -v n="$b" 'BEGIN{printf "%.1fKB", n/1024}'
+  elif [[ $b -lt 1073741824 ]];    then awk -v n="$b" 'BEGIN{printf "%.1fMB", n/1048576}'
+  elif [[ $b -lt 1099511627776 ]]; then awk -v n="$b" 'BEGIN{printf "%.2fGB", n/1073741824}'
+  else                                  awk -v n="$b" 'BEGIN{printf "%.2fTB", n/1099511627776}'
+  fi
+}
+
+k8s_backups_list() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  local body data
+  body=$(_api_get "/kubernetes/clusters/${id}/backups")
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Backups for cluster ${id}${NC}"
+  echo ""
+
+  if [[ -z "$data" || "$data" == "null" || "$data" == "[]" ]]; then
+    echo "  (no backups)"
+    return
+  fi
+
+  # Print a hand-rolled table so we can format sizeBytes as human-readable.
+  printf "  %-26s  %-32s  %-10s  %-10s  %-25s  %-25s\n" \
+    "ID" "FILENAME" "STATUS" "SIZE" "STARTED" "COMPLETED"
+  printf "  %s\n" "------------------------------------------------------------------------------------------------------------------------"
+
+  local count i bid bfile bstatus bsize bstart bend
+  if _has_jq; then
+    count=$(echo "$data" | jq 'length' 2>/dev/null || echo 0)
+  else
+    count=$(echo "$data" | _json_array_len)
+  fi
+  count="${count:-0}"
+  i=0
+  while [[ $i -lt $count ]]; do
+    bid=$(echo     "$data" | _json_get ".[${i}].id")
+    bfile=$(echo   "$data" | _json_get ".[${i}].filename")
+    bstatus=$(echo "$data" | _json_get ".[${i}].status")
+    bsize=$(echo   "$data" | _json_get ".[${i}].sizeBytes")
+    bstart=$(echo  "$data" | _json_get ".[${i}].startedAt")
+    bend=$(echo    "$data" | _json_get ".[${i}].completedAt")
+    [[ -z "$bsize" || "$bsize" == "null" ]] && bsize="-" || bsize=$(_human_bytes "$bsize")
+    [[ -z "$bend"  || "$bend"  == "null" ]] && bend="-"
+    printf "  %-26s  %-32s  %-10s  %-10s  %-25s  %-25s\n" \
+      "${bid:--}" "${bfile:--}" "${bstatus:--}" "$bsize" "${bstart:--}" "$bend"
+    i=$((i+1))
+  done
+}
+
+k8s_backup_create() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "CLUSTER_ID" "$id"
+
+  _info "Triggering manual backup for cluster ${BOLD}${id}${NC} ..."
+  local body data
+  body=$(_api_post "/kubernetes/clusters/${id}/backups" "{}")
+  data=$(_extract_data "$body")
+
+  local bid bstatus
+  bid=$(echo "$data" | _json_get '.id')
+  bstatus=$(echo "$data" | _json_get '.status')
+  _success "Backup queued."
+  echo ""
+  echo "  Backup ID: ${bid:--}"
+  echo "  Status:    ${bstatus:--}"
+  echo ""
+  echo "  Run 'devskin k8s backups ${id}' to track progress."
+}
+
+k8s_backup_download() {
+  _require_auth
+  local id="${1:-}"
+  local backup_id="${2:-}"
+  _require_arg "CLUSTER_ID" "$id"
+  _require_arg "BACKUP_ID"  "$backup_id"
+  shift 2 2>/dev/null || true
+
+  local save_path
+  save_path=$(_parse_flag "--save" "$@")
+
+  local body data url expires
+  body=$(_api_get "/kubernetes/clusters/${id}/backups/${backup_id}/download")
+  data=$(_extract_data "$body")
+  url=$(echo "$data" | _json_get '.url')
+  expires=$(echo "$data" | _json_get '.expiresIn')
+
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    _fatal "API did not return a download URL."
+  fi
+
+  if [[ -n "$save_path" ]]; then
+    _info "Downloading backup ${backup_id} → ${save_path} ..."
+    if curl -fL -o "$save_path" "$url"; then
+      _success "Saved to ${save_path}"
+    else
+      _fatal "Download failed."
+    fi
+  else
+    echo -e "${BOLD}Presigned URL${NC} (expires in ${expires:-?}s):"
+    echo ""
+    echo "$url"
+  fi
+}
+
+k8s_backup_delete() {
+  _require_auth
+  local id="${1:-}"
+  local backup_id="${2:-}"
+  _require_arg "CLUSTER_ID" "$id"
+  _require_arg "BACKUP_ID"  "$backup_id"
+
+  read -rp "Delete backup ${backup_id} of cluster ${id}? This cannot be undone. [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting backup ${BOLD}${backup_id}${NC} ..."
+  _api_delete "/kubernetes/clusters/${id}/backups/${backup_id}" >/dev/null
+  _success "Backup ${backup_id} deleted."
+}
+
+# ── Optimization (KubeTurbo-equivalent recommendations) ─────────────────────
+
+k8s_optimize() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)       k8s_optimize_list "$@" ;;
+    show|get)   k8s_optimize_show "$@" ;;
+    apply)      k8s_optimize_apply "$@" ;;
+    dismiss)    k8s_optimize_dismiss "$@" ;;
+    savings)    k8s_optimize_savings "$@" ;;
+    scan)       k8s_optimize_scan "$@" ;;
+    help|*)     k8s_optimize_help ;;
+  esac
+}
+
+k8s_optimize_help() {
+  cat <<EOF
+${BOLD}Usage:${NC} devskin k8s optimize <subcommand> [options]
+
+${BOLD}Subcommands:${NC}
+  list [--cluster ID] [--status NEW|APPLIED|DISMISSED|EXPIRED]
+       [--type rightsizing|binpack] [--sort savings|confidence|newest]
+                                    List recommendations
+  show ID                           Show full detail (incl. metrics snapshot)
+  apply ID                          Apply — MODIFIES the cluster (asks confirmation)
+  dismiss ID                        Mark recommendation as DISMISSED
+  savings [--cluster ID]            Aggregated savings + top-10
+  scan                              Admin: trigger a fresh analyzer pass
+EOF
+}
+
+# Format a USD number as US$ X.XX
+_k8s_opt_usd() {
+  local v="${1:-0}"
+  if ! [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then echo "US\$ -"; return; fi
+  awk -v n="$v" 'BEGIN{printf "US$ %.2f", n}'
+}
+
+# Truncate ID-short
+_k8s_opt_short() {
+  local v="${1:-}"
+  [[ -z "$v" || "$v" == "null" ]] && { echo "-"; return; }
+  if [[ ${#v} -gt 8 ]]; then echo "${v:0:8}"; else echo "$v"; fi
+}
+
+# Compute a relative age string from an ISO timestamp
+_k8s_opt_age() {
+  local ts="${1:-}"
+  [[ -z "$ts" || "$ts" == "null" || "$ts" == "-" ]] && { echo "-"; return; }
+  if _has_python; then
+    $(_python_bin) -c "
+import sys, datetime
+try:
+    s = '''$ts'''.replace('Z','+00:00')
+    t = datetime.datetime.fromisoformat(s)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    d = int((now - t).total_seconds())
+    if d < 60: print(f'{d}s')
+    elif d < 3600: print(f'{d//60}m')
+    elif d < 86400: print(f'{d//3600}h')
+    else: print(f'{d//86400}d')
+except Exception:
+    print('-')
+" 2>/dev/null
+  else
+    echo "$ts"
+  fi
+}
+
+k8s_optimize_list() {
+  _require_auth
+  local cluster status type sort
+  cluster=$(_parse_flag "--cluster" "$@")
+  status=$(_parse_flag  "--status"  "$@")
+  type=$(_parse_flag    "--type"    "$@")
+  sort=$(_parse_flag    "--sort"    "$@")
+
+  local qs="" first=1
+  for kv in \
+      "status=${status}" \
+      "type=${type}" \
+      "clusterId=${cluster}" \
+      "sort=${sort}"; do
+    local val="${kv#*=}"
+    [[ -z "$val" ]] && continue
+    if [[ $first -eq 1 ]]; then qs="?"; first=0; else qs="${qs}&"; fi
+    qs="${qs}${kv}"
+  done
+
+  local body data
+  body=$(_api_get "/optimization/recommendations${qs}")
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Optimization Recommendations${NC}"
+  echo ""
+
+  if [[ -z "$data" || "$data" == "null" || "$data" == "[]" ]]; then
+    echo "  (no recommendations)"
+    return
+  fi
+
+  printf "  %-10s  %-12s  %-9s  %-32s  %-13s  %-11s  %s\n" \
+    "ID" "TYPE" "SEVERITY" "RESOURCE" "SAVINGS/MO" "CONFIDENCE" "AGE"
+  printf "  %s\n" "------------------------------------------------------------------------------------------------------------------------"
+
+  local count i
+  if _has_jq; then
+    count=$(echo "$data" | jq 'length' 2>/dev/null || echo 0)
+  else
+    count=$(echo "$data" | _json_array_len)
+  fi
+  count="${count:-0}"
+  i=0
+  while [[ $i -lt $count ]]; do
+    local rid rtype rsev rres rsav rconf rcreated rage rsav_str rconf_str
+    rid=$(echo      "$data" | _json_get ".[${i}].id")
+    rtype=$(echo    "$data" | _json_get ".[${i}].type")
+    rsev=$(echo     "$data" | _json_get ".[${i}].severity")
+    rres=$(echo     "$data" | _json_get ".[${i}].resource")
+    rsav=$(echo     "$data" | _json_get ".[${i}].estimatedMonthlySavingsUsd")
+    rconf=$(echo    "$data" | _json_get ".[${i}].confidence")
+    rcreated=$(echo "$data" | _json_get ".[${i}].createdAt")
+
+    [[ -z "$rres" || "$rres" == "null" ]] && rres="-"
+    [[ -z "$rsev" || "$rsev" == "null" ]] && rsev="-"
+    [[ -z "$rtype" || "$rtype" == "null" ]] && rtype="-"
+    rsav_str=$(_k8s_opt_usd "${rsav:-0}")
+    if [[ "$rconf" =~ ^[0-9.]+$ ]]; then
+      rconf_str=$(awk -v c="$rconf" 'BEGIN{printf "%.0f%%", (c<=1?c*100:c)}')
+    else
+      rconf_str="-"
+    fi
+    rage=$(_k8s_opt_age "$rcreated")
+    if [[ ${#rres} -gt 32 ]]; then rres="${rres:0:29}..."; fi
+
+    printf "  %-10s  %-12s  %-9s  %-32s  %-13s  %-11s  %s\n" \
+      "$(_k8s_opt_short "$rid")" "${rtype}" "${rsev}" "${rres}" "${rsav_str}" "${rconf_str}" "${rage}"
+    i=$((i+1))
+  done
+}
+
+k8s_optimize_show() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "RECOMMENDATION_ID" "$id"
+
+  local body data
+  body=$(_api_get "/optimization/recommendations/${id}")
+  data=$(_extract_data "$body")
+
+  echo -e "${BOLD}Recommendation Detail${NC}"
+  echo ""
+  echo "  ID:            $(echo "$data" | _json_get '.id')"
+  echo "  Type:          $(echo "$data" | _json_get '.type')"
+  echo "  Severity:      $(echo "$data" | _json_get '.severity')"
+  echo "  Status:        $(echo "$data" | _json_get '.status')"
+  echo "  Cluster:       $(echo "$data" | _json_get '.clusterId')"
+  echo "  Resource:      $(echo "$data" | _json_get '.resource')"
+  echo "  Namespace:     $(echo "$data" | _json_get '.namespace')"
+  local sav conf
+  sav=$(echo "$data" | _json_get '.estimatedMonthlySavingsUsd')
+  conf=$(echo "$data" | _json_get '.confidence')
+  echo "  Savings/mo:    $(_k8s_opt_usd "${sav:-0}")"
+  echo "  Confidence:    ${conf:--}"
+  echo "  Created:       $(echo "$data" | _json_get '.createdAt')"
+  echo "  Rationale:     $(echo "$data" | _json_get '.rationale')"
+  echo ""
+  echo -e "${BOLD}Metrics Snapshot${NC}"
+  if _has_jq; then
+    echo "$data" | jq '.metricsJson // {}'
+  else
+    echo "$data" | _json_get '.metricsJson'
+  fi
+}
+
+k8s_optimize_apply() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "RECOMMENDATION_ID" "$id"
+
+  _warn "WARNING: applying a recommendation MODIFIES the live cluster."
+  _warn "  rightsizing → patches the Deployment's resource requests/limits (rolling restart)."
+  _warn "  binpack     → cordons + drains the target node."
+  read -rp "Apply recommendation ${id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Applying recommendation ${BOLD}${id}${NC} ..."
+  local body data status
+  body=$(_api_post "/optimization/recommendations/${id}/apply" "{}")
+  data=$(_extract_data "$body")
+  status=$(echo "$data" | _json_get '.status')
+  _success "Recommendation ${id} applied (status=${status:--})."
+}
+
+k8s_optimize_dismiss() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "RECOMMENDATION_ID" "$id"
+
+  _info "Dismissing recommendation ${BOLD}${id}${NC} ..."
+  _api_post "/optimization/recommendations/${id}/dismiss" "{}" >/dev/null
+  _success "Recommendation ${id} dismissed."
+}
+
+k8s_optimize_savings() {
+  _require_auth
+  local cluster
+  cluster=$(_parse_flag "--cluster" "$@")
+
+  local qs=""
+  [[ -n "$cluster" ]] && qs="?clusterId=${cluster}"
+
+  local body data
+  body=$(_api_get "/optimization/savings${qs}")
+  data=$(_extract_data "$body")
+
+  if [[ -z "$data" || "$data" == "null" ]]; then
+    echo "  (no savings data)"
+    return
+  fi
+
+  local cname potential applied applied_count rec_count
+  cname=$(echo "$data" | _json_get '.clusterName')
+  [[ -z "$cname" || "$cname" == "null" ]] && cname="${cluster:-(all clusters)}"
+  potential=$(echo "$data"     | _json_get '.potentialMonthlyUsd')
+  applied=$(echo "$data"       | _json_get '.appliedMonthlyUsd')
+  applied_count=$(echo "$data" | _json_get '.appliedActionCount')
+  rec_count=$(echo "$data"     | _json_get '.recommendationCount')
+
+  echo ""
+  echo "Cluster: ${cname}"
+  echo "Potential savings: $(_k8s_opt_usd "${potential:-0}")/mo"
+
+  # byType breakdown
+  local rs_amount rs_count bp_amount bp_count
+  if _has_jq; then
+    rs_amount=$(echo "$data" | jq -r '.byType.rightsizing.amount // 0' 2>/dev/null)
+    rs_count=$(echo  "$data" | jq -r '.byType.rightsizing.count // 0'  2>/dev/null)
+    bp_amount=$(echo "$data" | jq -r '.byType.binpack.amount // 0'     2>/dev/null)
+    bp_count=$(echo  "$data" | jq -r '.byType.binpack.count // 0'      2>/dev/null)
+  else
+    rs_amount=$(echo "$data" | _json_get '.byType.rightsizing.amount')
+    rs_count=$(echo  "$data" | _json_get '.byType.rightsizing.count')
+    bp_amount=$(echo "$data" | _json_get '.byType.binpack.amount')
+    bp_count=$(echo  "$data" | _json_get '.byType.binpack.count')
+  fi
+  rs_amount="${rs_amount:-0}"; rs_count="${rs_count:-0}"
+  bp_amount="${bp_amount:-0}"; bp_count="${bp_count:-0}"
+  echo "  ├─ rightsizing: $(_k8s_opt_usd "$rs_amount") (${rs_count} recommendations)"
+  echo "  └─ bin-packing: $(_k8s_opt_usd "$bp_amount") (${bp_count} recommendations)"
+  echo "Applied last month: $(_k8s_opt_usd "${applied:-0}") (${applied_count:-0} actions)"
+  echo "Total recommendations: ${rec_count:-0}"
+  echo ""
+
+  echo -e "${BOLD}Top 10 by savings:${NC}"
+  local top10 count i
+  if _has_jq; then
+    top10=$(echo "$data" | jq -c '.top10 // []' 2>/dev/null)
+    count=$(echo "$top10" | jq 'length' 2>/dev/null || echo 0)
+  else
+    top10=$(echo "$data" | _json_get '.top10')
+    [[ -z "$top10" || "$top10" == "null" ]] && top10="[]"
+    count=$(echo "$top10" | _json_array_len)
+  fi
+  count="${count:-0}"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (none)"
+    return
+  fi
+
+  i=0
+  while [[ $i -lt $count ]]; do
+    local tres ttype tsav rank
+    tres=$(echo  "$top10" | _json_get ".[${i}].resource")
+    ttype=$(echo "$top10" | _json_get ".[${i}].type")
+    tsav=$(echo  "$top10" | _json_get ".[${i}].estimatedMonthlySavingsUsd")
+    [[ -z "$tres" || "$tres" == "null" ]] && tres="-"
+    [[ -z "$ttype" || "$ttype" == "null" ]] && ttype="-"
+    rank=$((i+1))
+    printf "  %2d. %-30s -%s  %s\n" "$rank" "$tres" "$(_k8s_opt_usd "${tsav:-0}")/mo" "$ttype"
+    i=$((i+1))
+  done
+}
+
+k8s_optimize_scan() {
+  _require_auth
+  _info "Triggering a fresh optimization analyzer pass ..."
+  local body data status
+  body=$(_api_post "/optimization/scan" "{}")
+  data=$(_extract_data "$body")
+  status=$(echo "$data" | _json_get '.status')
+  _success "Scan triggered (status=${status:-queued}). Run 'devskin k8s optimize list' shortly to see new recommendations."
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3030,6 +4020,7 @@ cmd_billing() {
     subscription) billing_subscription "$@" ;;
     usage)        billing_usage "$@" ;;
     invoices)     billing_invoices "$@" ;;
+    reminders)    billing_reminders "$@" ;;
     help|*)       billing_help ;;
   esac
 }
@@ -3042,7 +4033,29 @@ ${BOLD}Subcommands:${NC}
   subscription                      Show current subscription
   usage                             Show usage summary
   invoices                          List invoices
+  reminders                         Show dunning reminder cadence per OPEN invoice
+                                    (reminderCount, lastReminderSentAt, days overdue)
 EOF
+}
+
+billing_reminders() {
+  _require_auth
+  local body data
+  body=$(_api_get "/billing/invoices")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Invoice Reminders (OPEN only)${NC}"
+  echo ""
+  if _has_jq; then
+    echo "$data" | jq -r '
+      .[] | select(.status == "OPEN") |
+      [.number, .amount, .currency, (.reminderCount // 0),
+       (.lastReminderSentAt // "-"),
+       (if .dueDate then (((now - (.dueDate|fromdateiso8601))/86400) | floor | tostring + "d") else "-" end)
+      ] | @tsv' \
+      | column -t -s $'\t' -N "INVOICE,AMOUNT,CURRENCY,REMINDERS,LAST_SENT,OVERDUE"
+  else
+    echo "$data" | _json_pretty
+  fi
 }
 
 billing_subscription() {
@@ -3109,7 +4122,9 @@ ${BOLD}Subcommands:${NC}
          [--cpu CPU] [--memory MEM] [--replicas N] [--env KEY=VALUE ...]
          [--source-repo REPO] [--source-branch BRANCH]
          [--endpoint-mode direct|loadbalancer] [--lb-id ID]
-                                    Create a new container service
+         [--monitoring-api-key KEY]
+                                    Create a new container service (set --monitoring-api-key
+                                    to enroll the service into Flux observability)
   get ID                            Show container service details
   delete ID                         Delete a container service
   deploy ID                         Deploy/update a container service
@@ -3133,7 +4148,7 @@ container_list() {
 container_create() {
   _require_auth
   local name image cpu memory replicas cluster_id task_def_id port
-  local source_repo source_branch endpoint_mode lb_id
+  local source_repo source_branch endpoint_mode lb_id monitoring_key
   name=$(_parse_flag "--name" "$@")
   image=$(_parse_flag "--image" "$@")
   cpu=$(_parse_flag "--cpu" "$@")
@@ -3146,6 +4161,7 @@ container_create() {
   source_branch=$(_parse_flag "--source-branch" "$@")
   endpoint_mode=$(_parse_flag "--endpoint-mode" "$@")
   lb_id=$(_parse_flag "--lb-id" "$@")
+  monitoring_key=$(_parse_flag "--monitoring-api-key" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--cluster-id" "$cluster_id"
@@ -3179,6 +4195,10 @@ container_create() {
   done
   env_json="${env_json}}"
   [[ $env_count -gt 0 ]] && payload="${payload},\"environment\":${env_json}"
+
+  if [[ -n "$monitoring_key" ]]; then
+    payload="${payload},\"monitoring\":{\"enabled\":true,\"apiKey\":\"${monitoring_key}\"}"
+  fi
 
   payload="${payload}}"
 
@@ -5125,8 +6145,57 @@ cmd_ai() {
   case "$sub" in
     models)     ai_models "$@" ;;
     chat)       ai_chat "$@" ;;
+    image)      ai_image "$@" ;;
+    speak)      ai_speak "$@" ;;
+    transcribe) ai_transcribe "$@" ;;
+    embed)      ai_embed "$@" ;;
+    kb)         cmd_ai_kb "$@" ;;
+    guardrails) cmd_ai_guardrails "$@" ;;
+    eval)       cmd_ai_eval "$@" ;;
     usage)      ai_usage "$@" ;;
     help|*)     ai_help ;;
+  esac
+}
+
+cmd_ai_guardrails() {
+  _require_auth
+  local sub="${1:-show}"; shift 2>/dev/null || true
+  case "$sub" in
+    show)    _extract_data "$(_api_get "/ai/guardrails")" | _json_pretty ;;
+    enable)  _extract_data "$(_api_request PUT "/ai/guardrails" '{"enabled":true}')" | _json_pretty ;;
+    disable) _extract_data "$(_api_request PUT "/ai/guardrails" '{"enabled":false}')" | _json_pretty ;;
+    test)
+      local text; text=$(_parse_flag "--text" "$@")
+      _require_arg "--text" "$text"
+      _extract_data "$(_api_post "/ai/guardrails/test" "{\"text\":\"${text}\"}")" | _json_pretty
+      ;;
+    *) echo "Usage: devskin ai guardrails {show|enable|disable|test --text \"...\"}" ;;
+  esac
+}
+
+cmd_ai_eval() {
+  _require_auth
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)
+      _extract_data "$(_api_get "/ai/evaluations")" | _format_table id name status totalCostUsd
+      ;;
+    show)
+      local id; id=$(_parse_flag "--id" "$@")
+      _require_arg "--id" "$id"
+      _extract_data "$(_api_get "/ai/evaluations/${id}")" | _json_pretty
+      ;;
+    run)
+      local payload; payload=$(_parse_flag "--json" "$@")
+      _require_arg "--json" "$payload"
+      _extract_data "$(_api_post "/ai/evaluations" "$payload")" | _json_pretty
+      ;;
+    delete)
+      local id; id=$(_parse_flag "--id" "$@")
+      _require_arg "--id" "$id"
+      _api_delete "/ai/evaluations/${id}" | _json_pretty
+      ;;
+    *) echo "Usage: devskin ai eval {list|show --id ID|run --json '{...}'|delete --id ID}" ;;
   esac
 }
 
@@ -5134,10 +6203,27 @@ ai_help() {
   cat <<EOF
 ${BOLD}Usage:${NC} devskin ai <subcommand> [options]
 
-${BOLD}Subcommands:${NC}
-  models                            List available AI models
-  chat --model MODEL --message MSG  Send a chat message
-  usage                             Show AI usage stats
+${BOLD}Models / Catalog:${NC}
+  models                                       List available models (OpenAI GPT-5.x, Claude 4.x)
+
+${BOLD}Chat / Generation:${NC}
+  chat --model MODEL --message MSG             Send a chat message
+  image --prompt "..." [--model gpt-image-1]   Generate an image (DALL·E 3 / GPT Image 2.0)
+                  [--size 1024x1024] [--quality high]
+  speak --text "..." [--voice nova]            Synthesize speech (TTS)
+  transcribe --file path/to/audio.webm         Transcribe audio with Whisper
+  embed --text "..." [--model text-embedding-3-small]  Create embedding vector
+
+${BOLD}Knowledge Bases (RAG):${NC}
+  kb list                                      List Knowledge Bases
+  kb create --name N [--description D]         Create a new KB
+  kb show --id KBID                            Show KB documents
+  kb add --id KBID --file F                    Ingest a text document
+  kb query --id KBID --query "..."             RAG query (returns answer + cited sources)
+  kb delete --id KBID                          Delete a KB
+
+${BOLD}Usage:${NC}
+  usage                                        Show AI usage stats this month
 EOF
 }
 
@@ -5145,12 +6231,7 @@ ai_models() {
   _require_auth
   local body
   body=$(_api_get "/ai/models")
-  local data
-  data=$(_extract_data "$body")
-
-  echo -e "${BOLD}AI Models${NC}"
-  echo ""
-  echo "$data" | _format_table id name provider status
+  _extract_data "$body" | _json_pretty
 }
 
 ai_chat() {
@@ -5166,11 +6247,1264 @@ ai_chat() {
   _extract_data "$body" | _json_pretty
 }
 
+ai_image() {
+  _require_auth
+  local prompt model size quality n
+  prompt=$(_parse_flag "--prompt" "$@")
+  model=$(_parse_flag "--model" "$@")
+  size=$(_parse_flag "--size" "$@")
+  quality=$(_parse_flag "--quality" "$@")
+  n=$(_parse_flag "--n" "$@")
+  _require_arg "--prompt" "$prompt"
+
+  local payload="{\"prompt\":\"${prompt}\""
+  [[ -n "$model" ]]   && payload+=",\"model\":\"${model}\""
+  [[ -n "$size" ]]    && payload+=",\"size\":\"${size}\""
+  [[ -n "$quality" ]] && payload+=",\"quality\":\"${quality}\""
+  [[ -n "$n" ]]       && payload+=",\"n\":${n}"
+  payload+="}"
+
+  local body
+  body=$(_api_post "/ai/images/generate" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_speak() {
+  _require_auth
+  local text voice model fmt
+  text=$(_parse_flag "--text" "$@")
+  voice=$(_parse_flag "--voice" "$@")
+  model=$(_parse_flag "--model" "$@")
+  fmt=$(_parse_flag "--format" "$@")
+  _require_arg "--text" "$text"
+
+  local payload="{\"text\":\"${text}\""
+  [[ -n "$voice" ]] && payload+=",\"voice\":\"${voice}\""
+  [[ -n "$model" ]] && payload+=",\"model\":\"${model}\""
+  [[ -n "$fmt" ]]   && payload+=",\"format\":\"${fmt}\""
+  payload+="}"
+
+  local out="speech-$(date +%s).mp3"
+  curl -sS -X POST "${API_BASE}/ai/text-to-speech" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" -o "$out"
+  echo "Saved: $out"
+}
+
+ai_transcribe() {
+  _require_auth
+  local file lang
+  file=$(_parse_flag "--file" "$@")
+  lang=$(_parse_flag "--language" "$@")
+  _require_arg "--file" "$file"
+  [[ -f "$file" ]] || { echo "File not found: $file"; return 1; }
+
+  local b64
+  b64=$(base64 -w0 "$file")
+  local payload="{\"audio\":\"${b64}\""
+  [[ -n "$lang" ]] && payload+=",\"language\":\"${lang}\""
+  payload+="}"
+
+  local body
+  body=$(_api_post "/ai/speech-to-text" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_embed() {
+  _require_auth
+  local text model
+  text=$(_parse_flag "--text" "$@")
+  model=$(_parse_flag "--model" "$@")
+  _require_arg "--text" "$text"
+  local payload="{\"text\":\"${text}\""
+  [[ -n "$model" ]] && payload+=",\"model\":\"${model}\""
+  payload+="}"
+  local body
+  body=$(_api_post "/ai/embeddings" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+cmd_ai_kb() {
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)   ai_kb_list "$@" ;;
+    create) ai_kb_create "$@" ;;
+    show)   ai_kb_show "$@" ;;
+    add)    ai_kb_add "$@" ;;
+    query)  ai_kb_query "$@" ;;
+    delete) ai_kb_delete "$@" ;;
+    *)      ai_help ;;
+  esac
+}
+
+ai_kb_list() {
+  _require_auth
+  local body
+  body=$(_api_get "/ai/knowledge-bases")
+  _extract_data "$body" | _format_table id name documentCount totalChunks
+}
+
+ai_kb_create() {
+  _require_auth
+  local name desc embed chat
+  name=$(_parse_flag "--name" "$@")
+  desc=$(_parse_flag "--description" "$@")
+  embed=$(_parse_flag "--embedding-model" "$@")
+  chat=$(_parse_flag "--chat-model" "$@")
+  _require_arg "--name" "$name"
+  local payload="{\"name\":\"${name}\""
+  [[ -n "$desc" ]]  && payload+=",\"description\":\"${desc}\""
+  [[ -n "$embed" ]] && payload+=",\"embeddingModel\":\"${embed}\""
+  [[ -n "$chat" ]]  && payload+=",\"chatModel\":\"${chat}\""
+  payload+="}"
+  local body
+  body=$(_api_post "/ai/knowledge-bases" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_kb_show() {
+  _require_auth
+  local id
+  id=$(_parse_flag "--id" "$@")
+  _require_arg "--id" "$id"
+  local body
+  body=$(_api_get "/ai/knowledge-bases/${id}")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_kb_add() {
+  _require_auth
+  local id file filename
+  id=$(_parse_flag "--id" "$@")
+  file=$(_parse_flag "--file" "$@")
+  _require_arg "--id" "$id"
+  _require_arg "--file" "$file"
+  [[ -f "$file" ]] || { echo "File not found: $file"; return 1; }
+  filename=$(basename "$file")
+  local text
+  text=$(jq -Rs . < "$file")
+  local payload="{\"filename\":\"${filename}\",\"text\":${text}}"
+  local body
+  body=$(_api_post "/ai/knowledge-bases/${id}/documents" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_kb_query() {
+  _require_auth
+  local id query topk model
+  id=$(_parse_flag "--id" "$@")
+  query=$(_parse_flag "--query" "$@")
+  topk=$(_parse_flag "--top-k" "$@")
+  model=$(_parse_flag "--model" "$@")
+  _require_arg "--id" "$id"
+  _require_arg "--query" "$query"
+  local payload="{\"query\":\"${query}\""
+  [[ -n "$topk" ]]  && payload+=",\"topK\":${topk}"
+  [[ -n "$model" ]] && payload+=",\"model\":\"${model}\""
+  payload+="}"
+  local body
+  body=$(_api_post "/ai/knowledge-bases/${id}/query" "$payload")
+  _extract_data "$body" | _json_pretty
+}
+
+ai_kb_delete() {
+  _require_auth
+  local id
+  id=$(_parse_flag "--id" "$@")
+  _require_arg "--id" "$id"
+  local body
+  body=$(_api_delete "/ai/knowledge-bases/${id}")
+  echo "$body" | _json_pretty
+}
+
 ai_usage() {
   _require_auth
   local body
   body=$(_api_get "/ai/usage")
   _extract_data "$body" | _json_pretty
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+#                         LAKEHOUSE (DevskinLake) COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+# Note: ML/AI lakehouse subcommands (`lake ml ...`) are intentionally NOT
+# exposed here — they are owned by another CLI agent.
+
+cmd_lake() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    catalog)   lake_catalog "$@" ;;
+    sql)       lake_sql "$@" ;;
+    spark)     lake_spark "$@" ;;
+    notebook|notebooks)
+               lake_notebook "$@" ;;
+    kafka|streaming)
+               lake_kafka "$@" ;;
+    airflow|workflow|workflows)
+               lake_airflow "$@" ;;
+    lineage)   lake_lineage "$@" ;;
+    quality)   lake_quality "$@" ;;
+    admin)     lake_admin "$@" ;;
+    help|*)    lake_help ;;
+  esac
+}
+
+lake_help() {
+  cat <<EOF
+${BOLD}Usage:${NC} devskin lake <subcommand> [options]
+
+${BOLD}Catalog:${NC}
+  lake catalog list                    List Lakehouse databases
+  lake catalog create NAME [--description S] [--bucket BUCKET_ID]
+                                       Create a new database
+  lake catalog delete DB_ID            Delete a database (asks for confirmation)
+  lake catalog tables DB_ID            List tables in a database
+  lake catalog tables create DB_ID --name N --columns name:type,name:type
+                                       Create an Iceberg table (schema cannot be patched)
+  lake catalog tables delete TABLE_ID  Delete a table (drops underlying data)
+  lake catalog optimize TABLE_ID [--sort-columns c1,c2,...]
+                                       Run an Iceberg OPTIMIZE on a table
+  lake catalog optimize-schedule TABLE_ID --schedule @hourly|@daily|@weekly|none
+                                       Set/clear the optimize schedule
+  lake catalog row-filters TABLE_ID --add ROLE:PREDICATE [--add ...]|--clear
+                                       Manage row-level access filters
+  lake catalog column-masks TABLE_ID --add COL:ROLE:hash|redact|partial [--add ...]|--clear
+                                       Manage column masks
+  lake catalog mv list DB_ID           List materialized views in a database
+  lake catalog mv create DB_ID --name N --query "..." [--schedule @daily]
+                                       Create a materialized view
+  lake catalog mv refresh MV_ID        Refresh a materialized view
+  lake catalog mv delete MV_ID         Delete a materialized view
+
+${BOLD}SQL:${NC}
+  lake sql run "QUERY"                 Submit a SQL query, poll until done
+  lake sql list [--limit N]            List recent SQL queries
+  lake sql cancel QUERY_ID             Cancel a running SQL query
+  lake sql ask "QUESTION" [--database DB_ID] [--run]
+                                       Genie NL->SQL: generate SQL via AI, optionally run
+  lake sql saved list                  List saved queries
+  lake sql saved create --name N --query FILE [--schedule @daily] [--description S]
+                                       Save a query (file contents become the query)
+  lake sql saved run ID                Execute a saved query
+  lake sql saved delete ID             Delete a saved query
+
+${BOLD}Spark Jobs:${NC}
+  lake spark list                      List Spark jobs
+  lake spark create --name N --code FILE [--language pyspark|scala|sql]
+                  [--driver-cores N] [--driver-mem GB]
+                  [--executor-cores N] [--executor-mem GB]
+                  [--executors N] [--schedule CRON]
+                                       Create a Spark job
+  lake spark run JOB_ID                Trigger a job run
+  lake spark runs JOB_ID               List runs of a job
+  lake spark logs JOB_ID RUN_ID        Print driver logs for a single run
+
+${BOLD}Data-Platform VMs:${NC} (deprecated managed paths — now marketplace VMs)
+  JupyterLab → \`devskin marketplace deploy mp-030 --name my-jupyter\`
+  Apache Kafka → \`devskin marketplace deploy mp-040 --name my-kafka\`
+  Apache Airflow → \`devskin marketplace deploy mp-050 --name my-airflow\`
+  The old \`lake notebook|kafka|airflow\` subcommands exit 1 with a pointer
+  to the marketplace flow.
+
+${BOLD}Lineage & Quality:${NC}
+  lake lineage                         Show data lineage graph
+  lake quality list                    List data-quality rules
+  lake quality create --name N --expectations FILE [--table TABLE_ID]
+                  [--schedule CRON]
+                                       Create a data-quality rule (JSON file)
+
+${BOLD}Admin:${NC}
+  lake admin status                    Show health of the Lakehouse stack
+  lake admin deploy                    Deploy/upgrade the entire stack
+  lake admin cost                      Show current vs previous month cost per area
+  lake admin warehouse                 Show Trino warehouse status (workers/running/queued)
+EOF
+}
+
+# ── Catalog ─────────────────────────────────────────────────────────────────
+lake_catalog() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)               lake_catalog_list "$@" ;;
+    create)             lake_catalog_create "$@" ;;
+    delete|remove|rm)   lake_catalog_delete "$@" ;;
+    tables)             lake_catalog_tables "$@" ;;
+    optimize)           lake_catalog_optimize "$@" ;;
+    optimize-schedule)  lake_catalog_optimize_schedule "$@" ;;
+    row-filters)        lake_catalog_row_filters "$@" ;;
+    column-masks)       lake_catalog_column_masks "$@" ;;
+    mv)                 lake_catalog_mv "$@" ;;
+    help|*)             echo "Usage: devskin lake catalog {list|create|delete|tables|optimize|optimize-schedule|row-filters|column-masks|mv}" ;;
+  esac
+}
+
+lake_catalog_list() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/catalog/databases")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Lakehouse Databases${NC}"
+  echo ""
+  echo "$data" | _format_table id name s3Location createdAt
+}
+
+lake_catalog_create() {
+  _require_auth
+  local name="${1:-}"; shift 2>/dev/null || true
+  _require_arg "NAME" "$name"
+  local description bucket
+  description=$(_parse_flag "--description" "$@")
+  bucket=$(_parse_flag "--bucket" "$@")
+
+  local payload="{\"name\":\"${name}\""
+  [[ -n "$description" ]] && payload+=",\"description\":\"${description}\""
+  [[ -n "$bucket" ]]      && payload+=",\"bucketId\":\"${bucket}\""
+  payload+="}"
+
+  _info "Creating Lakehouse database ${BOLD}${name}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/catalog/databases" "$payload")
+  data=$(_extract_data "$body")
+  _success "Database created."
+  echo ""
+  echo "  ID:          $(echo "$data" | _json_get '.id')"
+  echo "  Name:        $(echo "$data" | _json_get '.name')"
+  echo "  S3 Location: $(echo "$data" | _json_get '.s3Location')"
+}
+
+lake_catalog_delete() {
+  _require_auth
+  local db_id="${1:-}"
+  _require_arg "DB_ID" "$db_id"
+
+  read -rp "Are you sure you want to delete Lakehouse database ${db_id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting Lakehouse database ${BOLD}${db_id}${NC} ..."
+  _api_delete "/lakehouse/catalog/databases/${db_id}" >/dev/null
+  _success "Database deleted."
+}
+
+lake_catalog_tables() {
+  # First arg can be `create` / `delete` (sub-action) or a database id (legacy
+  # list behaviour). Anything else falls through to the list path.
+  local first="${1:-}"
+  case "$first" in
+    create)             shift; lake_catalog_tables_create "$@"; return $? ;;
+    delete|remove|rm)   shift; lake_catalog_tables_delete "$@"; return $? ;;
+  esac
+
+  _require_auth
+  local db_id="${first}"
+  _require_arg "DB_ID" "$db_id"
+  local body data
+  body=$(_api_get "/lakehouse/catalog/databases/${db_id}/tables")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Tables in database ${db_id}${NC}"
+  echo ""
+  echo "$data" | _format_table id name format rowCount sizeBytes
+}
+
+lake_catalog_tables_create() {
+  _require_auth
+  local db_id="${1:-}"; shift 2>/dev/null || true
+  _require_arg "DB_ID" "$db_id"
+
+  local name columns
+  name=$(_parse_flag "--name" "$@")
+  columns=$(_parse_flag "--columns" "$@")
+  _require_arg "--name" "$name"
+  _require_arg "--columns" "$columns"
+
+  # Build columns JSON from "id:bigint,created_at:timestamp,user_id:varchar".
+  local cols_json="["
+  local first=1
+  local IFS=','
+  for spec in $columns; do
+    local col_name="${spec%%:*}"
+    local col_type="${spec#*:}"
+    if [[ -z "$col_name" || -z "$col_type" || "$col_name" == "$col_type" ]]; then
+      _fatal "Invalid column spec '${spec}' — expected name:type."
+    fi
+    [[ $first -eq 1 ]] || cols_json+=","
+    cols_json+="{\"name\":\"${col_name}\",\"type\":\"${col_type}\"}"
+    first=0
+  done
+  cols_json+="]"
+  unset IFS
+
+  local payload="{\"name\":\"${name}\",\"columns\":${cols_json}}"
+  _info "Creating table ${BOLD}${name}${NC} in database ${db_id} ..."
+  local body data
+  body=$(_api_post "/lakehouse/catalog/databases/${db_id}/tables" "$payload")
+  data=$(_extract_data "$body")
+  _success "Table created."
+  echo ""
+  echo "  ID:          $(echo "$data" | _json_get '.id')"
+  echo "  Name:        $(echo "$data" | _json_get '.name')"
+  echo "  Format:      $(echo "$data" | _json_get '.format')"
+  echo "  S3 Location: $(echo "$data" | _json_get '.s3Location')"
+}
+
+lake_catalog_tables_delete() {
+  _require_auth
+  local table_id="${1:-}"
+  _require_arg "TABLE_ID" "$table_id"
+
+  read -rp "Are you sure you want to delete table ${table_id}? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+
+  _info "Deleting table ${BOLD}${table_id}${NC} ..."
+  _api_delete "/lakehouse/catalog/tables/${table_id}" >/dev/null
+  _success "Table deleted."
+}
+
+# ── SQL ─────────────────────────────────────────────────────────────────────
+lake_sql() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    run)               lake_sql_run "$@" ;;
+    list|ls)           lake_sql_list "$@" ;;
+    cancel|kill)       lake_sql_cancel "$@" ;;
+    ask)               lake_sql_ask "$@" ;;
+    saved)             lake_sql_saved "$@" ;;
+    help|*)            echo "Usage: devskin lake sql {run|list|cancel|ask|saved}" ;;
+  esac
+}
+
+lake_sql_run() {
+  _require_auth
+  local query="${1:-}"
+  _require_arg "QUERY" "$query"
+
+  # Encode query as JSON string (handles newlines, quotes safely).
+  local query_json payload
+  if _has_jq; then
+    query_json=$(printf '%s' "$query" | jq -Rs .)
+  else
+    # Fallback: naive escaping (replace " and \).
+    local esc
+    esc="${query//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    query_json="\"${esc}\""
+  fi
+  payload="{\"query\":${query_json}}"
+
+  _info "Submitting SQL query ..."
+  local body data qid
+  body=$(_api_post "/lakehouse/sql/queries" "$payload")
+  data=$(_extract_data "$body")
+  qid=$(echo "$data" | _json_get '.id')
+  if [[ -z "$qid" || "$qid" == "null" || "$qid" == "None" ]]; then
+    _error "Could not parse query id from response."
+    echo "$body" | _json_pretty
+    return 1
+  fi
+
+  _info "Query submitted (id=${qid}). Polling status..."
+  local status="pending" attempts=0
+  while [[ "$status" != "succeeded" && "$status" != "failed" && "$status" != "cancelled" && $attempts -lt 60 ]]; do
+    sleep 2
+    attempts=$((attempts + 1))
+    body=$(_api_get "/lakehouse/sql/queries/${qid}")
+    data=$(_extract_data "$body")
+    status=$(echo "$data" | _json_get '.status')
+    [[ "$status" == "null" || "$status" == "None" ]] && status="pending"
+  done
+
+  echo ""
+  echo "  Query ID:    ${qid}"
+  echo "  Status:      ${status}"
+  echo "  Rows:        $(echo "$data" | _json_get '.rowCount')"
+  echo "  Bytes Read:  $(echo "$data" | _json_get '.bytesScanned')"
+  echo "  Duration ms: $(echo "$data" | _json_get '.durationMs')"
+  if [[ "$status" == "failed" ]]; then
+    echo "  Error:       $(echo "$data" | _json_get '.errorMessage')"
+  fi
+}
+
+lake_sql_list() {
+  _require_auth
+  local limit
+  limit=$(_parse_flag "--limit" "$@")
+  local path="/lakehouse/sql/queries"
+  [[ -n "$limit" ]] && path="${path}?limit=${limit}"
+  local body data
+  body=$(_api_get "$path")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Recent SQL Queries${NC}"
+  echo ""
+  echo "$data" | _format_table id status rowCount durationMs createdAt
+}
+
+lake_sql_cancel() {
+  _require_auth
+  local qid="${1:-}"
+  _require_arg "QUERY_ID" "$qid"
+  _info "Cancelling query ${BOLD}${qid}${NC} ..."
+  _api_post "/lakehouse/sql/queries/${qid}/cancel" "{}" >/dev/null
+  _success "Cancel signal sent."
+}
+
+# ── Spark ──────────────────────────────────────────────────────────────────
+lake_spark() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls)           lake_spark_list "$@" ;;
+    create)            lake_spark_create "$@" ;;
+    run)               lake_spark_run "$@" ;;
+    runs)              lake_spark_runs "$@" ;;
+    logs)              lake_spark_logs "$@" ;;
+    help|*)            echo "Usage: devskin lake spark {list|create|run|runs|logs}" ;;
+  esac
+}
+
+lake_spark_list() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/spark/jobs")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Spark Jobs${NC}"
+  echo ""
+  echo "$data" | _format_table id name language scheduleCron status
+}
+
+lake_spark_create() {
+  _require_auth
+  local name code_file language driver_cores driver_mem executor_cores executor_mem executors schedule
+  name=$(_parse_flag "--name" "$@")
+  code_file=$(_parse_flag "--code" "$@")
+  language=$(_parse_flag "--language" "$@")
+  driver_cores=$(_parse_flag "--driver-cores" "$@")
+  driver_mem=$(_parse_flag "--driver-mem" "$@")
+  executor_cores=$(_parse_flag "--executor-cores" "$@")
+  executor_mem=$(_parse_flag "--executor-mem" "$@")
+  executors=$(_parse_flag "--executors" "$@")
+  schedule=$(_parse_flag "--schedule" "$@")
+
+  _require_arg "--name" "$name"
+  _require_arg "--code" "$code_file"
+  [[ -f "$code_file" ]] || _fatal "Code file not found: ${code_file}"
+
+  language="${language:-pyspark}"
+
+  # Encode the source file as a JSON string.
+  local code_json
+  if _has_jq; then
+    code_json=$(jq -Rs . < "$code_file")
+  else
+    _fatal "jq is required to encode the source file. Please install jq."
+  fi
+
+  local payload="{\"name\":\"${name}\",\"language\":\"${language}\",\"code\":${code_json}"
+  [[ -n "$driver_cores" ]]   && payload+=",\"driverCores\":${driver_cores}"
+  [[ -n "$driver_mem" ]]     && payload+=",\"driverMemoryGb\":${driver_mem}"
+  [[ -n "$executor_cores" ]] && payload+=",\"executorCores\":${executor_cores}"
+  [[ -n "$executor_mem" ]]   && payload+=",\"executorMemoryGb\":${executor_mem}"
+  [[ -n "$executors" ]]      && payload+=",\"numExecutors\":${executors}"
+  [[ -n "$schedule" ]]       && payload+=",\"scheduleCron\":\"${schedule}\""
+  payload+="}"
+
+  _info "Creating Spark job ${BOLD}${name}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/spark/jobs" "$payload")
+  data=$(_extract_data "$body")
+  _success "Spark job created."
+  echo ""
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Language: $(echo "$data" | _json_get '.language')"
+  echo "  Schedule: $(echo "$data" | _json_get '.scheduleCron')"
+}
+
+lake_spark_run() {
+  _require_auth
+  local job_id="${1:-}"
+  _require_arg "JOB_ID" "$job_id"
+  _info "Triggering Spark job ${BOLD}${job_id}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/spark/jobs/${job_id}/run" "{}")
+  data=$(_extract_data "$body")
+  _success "Run started."
+  echo "  Run ID: $(echo "$data" | _json_get '.id')"
+  echo "  Status: $(echo "$data" | _json_get '.status')"
+}
+
+lake_spark_runs() {
+  _require_auth
+  local job_id="${1:-}"
+  _require_arg "JOB_ID" "$job_id"
+  local body data
+  body=$(_api_get "/lakehouse/spark/jobs/${job_id}/runs")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Runs of Spark Job ${job_id}${NC}"
+  echo ""
+  echo "$data" | _format_table id status startedAt finishedAt durationMs
+}
+
+lake_spark_logs() {
+  _require_auth
+  local job_id="${1:-}" run_id="${2:-}"
+  _require_arg "JOB_ID" "$job_id"
+  _require_arg "RUN_ID" "$run_id"
+  local body data
+  body=$(_api_get "/lakehouse/spark/jobs/${job_id}/runs/${run_id}/logs")
+  data=$(_extract_data "$body")
+  # Backend returns { logs: "..." }; print plain text without JSON wrapping.
+  echo "$data" | _json_get '.logs'
+}
+
+# ── Notebook (DEPRECATED) ──────────────────────────────────────────────────
+# JupyterLab now ships as a marketplace VM (mp-030, tpl-206). The legacy
+# /lakehouse/notebooks endpoints still exist but the supported flow is to
+# deploy a Jupyter VM via marketplace.
+_lake_notebook_deprecated() {
+  echo "JupyterLab is now deployed as a marketplace VM (mp-030)." >&2
+  echo "" >&2
+  echo "  Spin up your own JupyterLab:" >&2
+  echo "    devskin marketplace deploy mp-030 --name my-jupyter" >&2
+  echo "" >&2
+  echo "  Then open https://<vm-public-ip>:8888/lab and use the token" >&2
+  echo "  shown on the Connect screen of the VM." >&2
+  echo "  See full instructions: devskin marketplace get mp-030" >&2
+  return 1
+}
+
+lake_notebook()        { _lake_notebook_deprecated; }
+lake_notebook_list()   { _lake_notebook_deprecated; }
+lake_notebook_create() { _lake_notebook_deprecated; }
+lake_notebook_start()  { _lake_notebook_deprecated; }
+lake_notebook_stop()   { _lake_notebook_deprecated; }
+
+# ── Kafka (DEPRECATED) ─────────────────────────────────────────────────────
+# Apache Kafka now ships as a marketplace VM (mp-040, tpl-204). The legacy
+# /lakehouse/streaming endpoints still exist but the supported flow is to
+# deploy a Kafka VM via marketplace.
+_lake_kafka_deprecated() {
+  echo "Apache Kafka is now deployed as a marketplace VM (mp-040)." >&2
+  echo "" >&2
+  echo "  Spin up your own Kafka cluster:" >&2
+  echo "    devskin marketplace deploy mp-040 --name my-kafka" >&2
+  echo "" >&2
+  echo "  Then connect with kafkacat / kafka-python using" >&2
+  echo "  bootstrap-server <vm-public-ip>:9092." >&2
+  echo "  See full instructions: devskin marketplace get mp-040" >&2
+  return 1
+}
+
+lake_kafka()        { _lake_kafka_deprecated; }
+lake_kafka_list()   { _lake_kafka_deprecated; }
+lake_kafka_create() { _lake_kafka_deprecated; }
+lake_kafka_topic()  { _lake_kafka_deprecated; }
+
+# ── Airflow (DEPRECATED) ───────────────────────────────────────────────────
+# Workflows endpoints were removed from the platform. Apache Airflow now ships
+# as a marketplace VM (mp-050) — every command in this subtree exits 1 with a
+# pointer to the new flow.
+_lake_airflow_deprecated() {
+  echo "Apache Airflow is now deployed as a marketplace VM (mp-050)." >&2
+  echo "" >&2
+  echo "  Spin up your own Airflow:" >&2
+  echo "    devskin marketplace deploy mp-050 --name my-airflow" >&2
+  echo "" >&2
+  echo "  Then drop DAG files at /opt/airflow/dags/ on the VM via SSH." >&2
+  echo "  See full instructions: devskin marketplace get mp-050" >&2
+  return 1
+}
+
+lake_airflow()         { _lake_airflow_deprecated; }
+lake_airflow_list()    { _lake_airflow_deprecated; }
+lake_airflow_upload()  { _lake_airflow_deprecated; }
+lake_airflow_trigger() { _lake_airflow_deprecated; }
+
+# ── Lineage ────────────────────────────────────────────────────────────────
+lake_lineage() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/lineage/graph")
+  data=$(_extract_data "$body")
+
+  if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    echo "$data" | _json_pretty
+    return
+  fi
+
+  echo -e "${BOLD}Lakehouse Data Lineage${NC}"
+  echo ""
+  local node_count edge_count
+  if _has_jq; then
+    node_count=$(echo "$data" | jq '.nodes | length // 0' 2>/dev/null)
+    edge_count=$(echo "$data" | jq '.edges | length // 0' 2>/dev/null)
+  else
+    node_count="?"; edge_count="?"
+  fi
+  echo "  Nodes: ${node_count}"
+  echo "  Edges: ${edge_count}"
+  echo ""
+  echo "Use --json for the full graph."
+}
+
+# ── Quality ────────────────────────────────────────────────────────────────
+lake_quality() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls)           lake_quality_list "$@" ;;
+    create)            lake_quality_create "$@" ;;
+    help|*)            echo "Usage: devskin lake quality {list|create}" ;;
+  esac
+}
+
+lake_quality_list() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/quality/rules")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Data-Quality Rules${NC}"
+  echo ""
+  echo "$data" | _format_table id name tableId scheduleCron status
+}
+
+lake_quality_create() {
+  _require_auth
+  local name expectations_file table schedule
+  name=$(_parse_flag "--name" "$@")
+  expectations_file=$(_parse_flag "--expectations" "$@")
+  table=$(_parse_flag "--table" "$@")
+  schedule=$(_parse_flag "--schedule" "$@")
+
+  _require_arg "--name" "$name"
+  _require_arg "--expectations" "$expectations_file"
+  [[ -f "$expectations_file" ]] || _fatal "Expectations file not found: ${expectations_file}"
+
+  # The expectations file must contain a JSON array of objects.
+  local expectations_json
+  expectations_json=$(cat "$expectations_file")
+  if _has_jq; then
+    if ! echo "$expectations_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      _fatal "Expectations file must contain a JSON array of expectation objects."
+    fi
+  fi
+
+  local payload="{\"name\":\"${name}\",\"expectations\":${expectations_json}"
+  [[ -n "$table" ]]    && payload+=",\"tableId\":\"${table}\""
+  [[ -n "$schedule" ]] && payload+=",\"scheduleCron\":\"${schedule}\""
+  payload+="}"
+
+  _info "Creating quality rule ${BOLD}${name}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/quality/rules" "$payload")
+  data=$(_extract_data "$body")
+  _success "Quality rule created."
+  echo ""
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Table:    $(echo "$data" | _json_get '.tableId')"
+  echo "  Schedule: $(echo "$data" | _json_get '.scheduleCron')"
+}
+
+# ── Admin ──────────────────────────────────────────────────────────────────
+lake_admin() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    status)            lake_admin_status "$@" ;;
+    deploy|upgrade)    lake_admin_deploy "$@" ;;
+    cost|costs)        lake_admin_cost "$@" ;;
+    warehouse)         lake_admin_warehouse "$@" ;;
+    help|*)            echo "Usage: devskin lake admin {status|deploy|cost|warehouse}" ;;
+  esac
+}
+
+lake_admin_status() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/admin/status")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Lakehouse Stack Status${NC}"
+  echo ""
+  echo "$data" | _json_pretty
+}
+
+lake_admin_deploy() {
+  _require_auth
+  _warn "This will (re)deploy the entire Lakehouse stack on the platform's internal cluster."
+  read -rp "Continue with deploy/upgrade? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "Aborted."
+    return
+  fi
+  _info "Triggering Lakehouse deploy ..."
+  local body data
+  body=$(_api_post "/lakehouse/admin/deploy" "{}")
+  data=$(_extract_data "$body")
+  _success "Deploy triggered."
+  echo ""
+  echo "$data" | _json_pretty
+}
+
+lake_admin_cost() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/admin/cost")
+  data=$(_extract_data "$body")
+  if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    echo "$data" | _json_pretty
+    return
+  fi
+  echo -e "${BOLD}Lakehouse Cost (current vs previous month)${NC}"
+  echo ""
+  if _has_jq; then
+    local rows
+    rows=$(echo "$data" | jq -r '.areas // . | (if type=="array" then .[] else . end) | "\(.area // .name)\t\(.currentMonth // .current // 0)\t\(.previousMonth // .previous // 0)\t\(.delta // 0)"' 2>/dev/null)
+    printf "  %-20s %-15s %-15s %-10s\n" "AREA" "CURRENT" "PREVIOUS" "DELTA"
+    printf "  %-20s %-15s %-15s %-10s\n" "----" "-------" "--------" "-----"
+    while IFS=$'\t' read -r area cur prev delta; do
+      [[ -z "$area" || "$area" == "null" ]] && continue
+      printf "  %-20s %-15s %-15s %-10s\n" "$area" "$cur" "$prev" "$delta"
+    done <<< "$rows"
+  else
+    echo "$data" | _json_pretty
+  fi
+}
+
+lake_admin_warehouse() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/admin/warehouse")
+  data=$(_extract_data "$body")
+  if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    echo "$data" | _json_pretty
+    return
+  fi
+  echo -e "${BOLD}Trino Warehouse Status${NC}"
+  echo ""
+  echo "  Status:           $(echo "$data" | _json_get '.status')"
+  echo "  Workers:          $(echo "$data" | _json_get '.workers')"
+  echo "  Active Workers:   $(echo "$data" | _json_get '.activeWorkers')"
+  echo "  Running Queries:  $(echo "$data" | _json_get '.runningQueries')"
+  echo "  Queued Queries:   $(echo "$data" | _json_get '.queuedQueries')"
+  echo "  Coordinator:      $(echo "$data" | _json_get '.coordinator')"
+}
+
+# ── Catalog: optimize ───────────────────────────────────────────────────────
+lake_catalog_optimize() {
+  _require_auth
+  local table_id="${1:-}"
+  if [[ -z "$table_id" || "$table_id" == --* ]]; then
+    _fatal "Missing TABLE_ID. Usage: devskin lake catalog optimize TABLE_ID [--sort-columns c1,c2,...]"
+  fi
+  shift || true
+  local sort_columns
+  sort_columns=$(_parse_flag "--sort-columns" "$@")
+
+  local payload="{}"
+  if [[ -n "$sort_columns" ]]; then
+    # Convert "c1,c2" to JSON array.
+    local cols_json
+    if _has_jq; then
+      cols_json=$(echo "$sort_columns" | jq -Rsc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+    else
+      cols_json="[$(echo "$sort_columns" | sed 's/[^,]*/"&"/g')]"
+    fi
+    payload="{\"sortColumns\":${cols_json}}"
+  fi
+
+  _info "Submitting OPTIMIZE for table ${BOLD}${table_id}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/catalog/tables/${table_id}/optimize" "$payload")
+  data=$(_extract_data "$body")
+  _success "Optimize submitted."
+  echo ""
+  echo "  Spark App ID:   $(echo "$data" | _json_get '.appId')"
+  echo "  Run ID:         $(echo "$data" | _json_get '.runId')"
+  echo "  Status:         $(echo "$data" | _json_get '.status')"
+}
+
+lake_catalog_optimize_schedule() {
+  _require_auth
+  local table_id="${1:-}"
+  if [[ -z "$table_id" || "$table_id" == --* ]]; then
+    _fatal "Missing TABLE_ID. Usage: devskin lake catalog optimize-schedule TABLE_ID --schedule @hourly|@daily|@weekly|none"
+  fi
+  shift || true
+  local schedule
+  schedule=$(_parse_flag "--schedule" "$@")
+  _require_arg "--schedule" "$schedule"
+
+  local sched_value
+  if [[ "$schedule" == "none" || "$schedule" == "off" ]]; then
+    sched_value="null"
+  else
+    sched_value="\"${schedule}\""
+  fi
+  local payload="{\"schedule\":${sched_value}}"
+
+  _info "Setting optimize schedule for table ${BOLD}${table_id}${NC} -> ${schedule} ..."
+  local body data
+  body=$(_api_put "/lakehouse/catalog/tables/${table_id}/optimize-schedule" "$payload")
+  data=$(_extract_data "$body")
+  _success "Schedule updated."
+  echo "  Schedule: $(echo "$data" | _json_get '.schedule')"
+}
+
+# ── Catalog: governance (row filters / column masks) ───────────────────────
+_collect_repeated_flag() {
+  # Echoes one VALUE per line, in order, for every "$flag VALUE" in args.
+  local flag="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$flag" && $# -ge 2 ]]; then
+      echo "$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+}
+
+_has_clear_flag() {
+  for arg in "$@"; do
+    [[ "$arg" == "--clear" ]] && return 0
+  done
+  return 1
+}
+
+lake_catalog_row_filters() {
+  _require_auth
+  local table_id="${1:-}"
+  if [[ -z "$table_id" || "$table_id" == --* ]]; then
+    _fatal "Missing TABLE_ID. Usage: devskin lake catalog row-filters TABLE_ID --add ROLE:PREDICATE [...] | --clear"
+  fi
+  shift || true
+
+  if _has_clear_flag "$@"; then
+    _info "Clearing row filters on table ${BOLD}${table_id}${NC} ..."
+    _api_put "/lakehouse/catalog/tables/${table_id}/row-filters" '{"rowFilters":[]}' >/dev/null
+    _success "Row filters cleared."
+    return
+  fi
+
+  local items_json="["
+  local first=1 entry
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    local role="" predicate="$entry"
+    if [[ "$entry" == *:* ]]; then
+      role="${entry%%:*}"
+      predicate="${entry#*:}"
+    fi
+    local pred_json role_json
+    if _has_jq; then
+      pred_json=$(printf '%s' "$predicate" | jq -Rs .)
+      role_json=$(printf '%s' "$role" | jq -Rs .)
+    else
+      pred_json="\"${predicate//\"/\\\"}\""
+      role_json="\"${role//\"/\\\"}\""
+    fi
+    if [[ $first -eq 0 ]]; then items_json+=","; fi
+    if [[ -n "$role" ]]; then
+      items_json+="{\"role\":${role_json},\"predicate\":${pred_json}}"
+    else
+      items_json+="{\"predicate\":${pred_json}}"
+    fi
+    first=0
+  done < <(_collect_repeated_flag "--add" "$@")
+
+  if [[ $first -eq 1 ]]; then
+    _fatal "Provide at least one --add ROLE:PREDICATE, or --clear to reset."
+  fi
+  items_json+="]"
+
+  local payload="{\"rowFilters\":${items_json}}"
+  _info "Updating row filters on table ${BOLD}${table_id}${NC} ..."
+  local body data
+  body=$(_api_put "/lakehouse/catalog/tables/${table_id}/row-filters" "$payload")
+  data=$(_extract_data "$body")
+  _success "Row filters updated."
+  echo "$data" | _json_pretty
+}
+
+lake_catalog_column_masks() {
+  _require_auth
+  local table_id="${1:-}"
+  if [[ -z "$table_id" || "$table_id" == --* ]]; then
+    _fatal "Missing TABLE_ID. Usage: devskin lake catalog column-masks TABLE_ID --add COL:ROLE:hash|redact|partial [...] | --clear"
+  fi
+  shift || true
+
+  if _has_clear_flag "$@"; then
+    _info "Clearing column masks on table ${BOLD}${table_id}${NC} ..."
+    _api_put "/lakehouse/catalog/tables/${table_id}/column-masks" '{"columnMasks":[]}' >/dev/null
+    _success "Column masks cleared."
+    return
+  fi
+
+  local items_json="["
+  local first=1 entry
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    # Format: COL:ROLE:MASKTYPE  (ROLE is optional => COL::MASKTYPE or COL:MASKTYPE)
+    local col="" role="" mask_type=""
+    IFS=':' read -r col role mask_type <<< "$entry"
+    if [[ -z "$mask_type" ]]; then
+      # Two-segment form: COL:MASKTYPE
+      mask_type="$role"
+      role=""
+    fi
+    if [[ -z "$col" || -z "$mask_type" ]]; then
+      _fatal "Invalid column-mask entry '${entry}'. Expected COL:ROLE:hash|redact|partial."
+    fi
+    case "$mask_type" in
+      hash|redact|partial) : ;;
+      *) _fatal "Invalid mask type '${mask_type}'. Must be one of: hash, redact, partial." ;;
+    esac
+    local col_json role_json mask_json
+    if _has_jq; then
+      col_json=$(printf '%s' "$col" | jq -Rs .)
+      role_json=$(printf '%s' "$role" | jq -Rs .)
+      mask_json=$(printf '%s' "$mask_type" | jq -Rs .)
+    else
+      col_json="\"${col//\"/\\\"}\""
+      role_json="\"${role//\"/\\\"}\""
+      mask_json="\"${mask_type//\"/\\\"}\""
+    fi
+    if [[ $first -eq 0 ]]; then items_json+=","; fi
+    if [[ -n "$role" ]]; then
+      items_json+="{\"column\":${col_json},\"role\":${role_json},\"maskType\":${mask_json}}"
+    else
+      items_json+="{\"column\":${col_json},\"maskType\":${mask_json}}"
+    fi
+    first=0
+  done < <(_collect_repeated_flag "--add" "$@")
+
+  if [[ $first -eq 1 ]]; then
+    _fatal "Provide at least one --add COL:ROLE:hash|redact|partial, or --clear to reset."
+  fi
+  items_json+="]"
+
+  local payload="{\"columnMasks\":${items_json}}"
+  _info "Updating column masks on table ${BOLD}${table_id}${NC} ..."
+  local body data
+  body=$(_api_put "/lakehouse/catalog/tables/${table_id}/column-masks" "$payload")
+  data=$(_extract_data "$body")
+  _success "Column masks updated."
+  echo "$data" | _json_pretty
+}
+
+# ── Catalog: materialized views ────────────────────────────────────────────
+lake_catalog_mv() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls)           lake_catalog_mv_list "$@" ;;
+    create)            lake_catalog_mv_create "$@" ;;
+    refresh)           lake_catalog_mv_refresh "$@" ;;
+    delete|remove|rm)  lake_catalog_mv_delete "$@" ;;
+    help|*)            echo "Usage: devskin lake catalog mv {list|create|refresh|delete}" ;;
+  esac
+}
+
+lake_catalog_mv_list() {
+  _require_auth
+  local db_id="${1:-}"
+  _require_arg "DB_ID" "$db_id"
+  local body data
+  body=$(_api_get "/lakehouse/catalog/databases/${db_id}/materialized-views")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Materialized Views in database ${db_id}${NC}"
+  echo ""
+  echo "$data" | _format_table id name refreshSchedule lastRefreshed status
+}
+
+lake_catalog_mv_create() {
+  _require_auth
+  local db_id="${1:-}"
+  if [[ -z "$db_id" || "$db_id" == --* ]]; then
+    _fatal "Missing DB_ID. Usage: devskin lake catalog mv create DB_ID --name N --query \"SELECT...\" [--schedule @daily]"
+  fi
+  shift || true
+  local name query schedule
+  name=$(_parse_flag "--name" "$@")
+  query=$(_parse_flag "--query" "$@")
+  schedule=$(_parse_flag "--schedule" "$@")
+  _require_arg "--name" "$name"
+  _require_arg "--query" "$query"
+
+  local query_json
+  if _has_jq; then
+    query_json=$(printf '%s' "$query" | jq -Rs .)
+  else
+    local esc="${query//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    query_json="\"${esc}\""
+  fi
+
+  local payload="{\"name\":\"${name}\",\"query\":${query_json}"
+  [[ -n "$schedule" ]] && payload+=",\"refreshSchedule\":\"${schedule}\""
+  payload+="}"
+
+  _info "Creating materialized view ${BOLD}${name}${NC} in db ${db_id} ..."
+  local body data
+  body=$(_api_post "/lakehouse/catalog/databases/${db_id}/materialized-views" "$payload")
+  data=$(_extract_data "$body")
+  _success "Materialized view created."
+  echo ""
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Schedule: $(echo "$data" | _json_get '.refreshSchedule')"
+  echo "  Status:   $(echo "$data" | _json_get '.status')"
+}
+
+lake_catalog_mv_refresh() {
+  _require_auth
+  local mv_id="${1:-}"
+  _require_arg "MV_ID" "$mv_id"
+  _info "Refreshing materialized view ${BOLD}${mv_id}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/catalog/materialized-views/${mv_id}/refresh" "{}")
+  data=$(_extract_data "$body")
+  _success "Refresh triggered."
+  echo "  Run ID: $(echo "$data" | _json_get '.runId')"
+  echo "  Status: $(echo "$data" | _json_get '.status')"
+}
+
+lake_catalog_mv_delete() {
+  _require_auth
+  local mv_id="${1:-}"
+  _require_arg "MV_ID" "$mv_id"
+  _info "Deleting materialized view ${BOLD}${mv_id}${NC} ..."
+  _api_delete "/lakehouse/catalog/materialized-views/${mv_id}" >/dev/null
+  _success "Materialized view deleted."
+}
+
+# ── SQL: ask (Genie NL->SQL) ────────────────────────────────────────────────
+lake_sql_ask() {
+  _require_auth
+  local question="${1:-}"
+  _require_arg "QUESTION" "$question"
+  shift || true
+
+  local database run=0
+  database=$(_parse_flag "--database" "$@")
+  for arg in "$@"; do
+    [[ "$arg" == "--run" ]] && run=1
+  done
+
+  local q_json
+  if _has_jq; then
+    q_json=$(printf '%s' "$question" | jq -Rs .)
+  else
+    local esc="${question//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    q_json="\"${esc}\""
+  fi
+  local payload="{\"question\":${q_json}"
+  [[ -n "$database" ]] && payload+=",\"databaseId\":\"${database}\""
+  payload+="}"
+
+  _info "Asking Genie ..."
+  local body data sql
+  body=$(_api_post "/lakehouse/sql/ask" "$payload")
+  data=$(_extract_data "$body")
+  sql=$(echo "$data" | _json_get '.sql')
+  if [[ -z "$sql" || "$sql" == "null" || "$sql" == "None" ]]; then
+    _error "Genie did not return a SQL statement."
+    echo "$body" | _json_pretty
+    return 1
+  fi
+  echo ""
+  echo -e "${BOLD}Generated SQL:${NC}"
+  echo ""
+  echo "  ${sql}"
+  echo ""
+
+  if [[ $run -eq 1 ]]; then
+    _info "Submitting generated SQL ..."
+    lake_sql_run "$sql"
+  else
+    echo "Run with --run to submit it."
+  fi
+}
+
+# ── SQL: saved queries ──────────────────────────────────────────────────────
+lake_sql_saved() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls)           lake_sql_saved_list "$@" ;;
+    create)            lake_sql_saved_create "$@" ;;
+    run)               lake_sql_saved_run "$@" ;;
+    delete|remove|rm)  lake_sql_saved_delete "$@" ;;
+    help|*)            echo "Usage: devskin lake sql saved {list|create|run|delete}" ;;
+  esac
+}
+
+lake_sql_saved_list() {
+  _require_auth
+  local body data
+  body=$(_api_get "/lakehouse/sql/saved")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Saved Queries${NC}"
+  echo ""
+  echo "$data" | _format_table id name scheduleCron lastRunAt
+}
+
+lake_sql_saved_create() {
+  _require_auth
+  local name query_file schedule description
+  name=$(_parse_flag "--name" "$@")
+  query_file=$(_parse_flag "--query" "$@")
+  schedule=$(_parse_flag "--schedule" "$@")
+  description=$(_parse_flag "--description" "$@")
+
+  _require_arg "--name" "$name"
+  _require_arg "--query" "$query_file"
+  [[ -f "$query_file" ]] || _fatal "Query file not found: ${query_file}"
+
+  local query_json
+  if _has_jq; then
+    query_json=$(jq -Rs . < "$query_file")
+  else
+    _fatal "jq is required to encode the query file. Please install jq."
+  fi
+
+  local payload="{\"name\":\"${name}\",\"query\":${query_json}"
+  [[ -n "$schedule" ]]    && payload+=",\"scheduleCron\":\"${schedule}\""
+  [[ -n "$description" ]] && payload+=",\"description\":\"${description}\""
+  payload+="}"
+
+  _info "Saving query ${BOLD}${name}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/sql/saved" "$payload")
+  data=$(_extract_data "$body")
+  _success "Query saved."
+  echo ""
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Schedule: $(echo "$data" | _json_get '.scheduleCron')"
+}
+
+lake_sql_saved_run() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "ID" "$id"
+  _info "Running saved query ${BOLD}${id}${NC} ..."
+  local body data
+  body=$(_api_post "/lakehouse/sql/saved/${id}/run" "{}")
+  data=$(_extract_data "$body")
+  _success "Run started."
+  echo "  Query ID: $(echo "$data" | _json_get '.queryId')"
+  echo "  Status:   $(echo "$data" | _json_get '.status')"
+}
+
+lake_sql_saved_delete() {
+  _require_auth
+  local id="${1:-}"
+  _require_arg "ID" "$id"
+  _info "Deleting saved query ${BOLD}${id}${NC} ..."
+  _api_delete "/lakehouse/sql/saved/${id}" >/dev/null
+  _success "Saved query deleted."
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5551,6 +7885,13 @@ ${BOLD}Kubernetes:${NC}
   k8s create             Create cluster   (--name, --version, [--nodes, --region, --vpc-id])
   k8s get ID             Show cluster details
   k8s delete ID          Delete cluster
+  k8s namespace-costs ID Per-namespace cost breakdown (use --all for cross-cluster)
+  k8s optimize list      List optimization recommendations
+  k8s optimize show ID   Show recommendation detail
+  k8s optimize apply ID  Apply recommendation (modifies the cluster)
+  k8s optimize dismiss ID  Dismiss a recommendation
+  k8s optimize savings   Aggregated savings + top 10
+  k8s optimize scan      Admin: trigger a fresh analyzer pass
 
 ${BOLD}DNS:${NC}
   dns list               List hosted zones
@@ -5733,9 +8074,66 @@ ${BOLD}Consumption:${NC}
   consumption prices     Service prices
 
 ${BOLD}AI Services:${NC}
-  ai models              List AI models
-  ai chat                Chat with AI     (--model, --message)
-  ai usage               Show AI usage
+  ai models              List AI models (OpenAI GPT-5.x, Claude 4.x)
+  ai chat                Chat with AI            (--model, --message)
+  ai image               Generate image          (--prompt, --model, --size, --quality, --n)
+  ai speak               Synthesize speech (TTS) (--text, --voice, --format)
+  ai transcribe          Transcribe audio (STT)  (--file, --language)
+  ai embed               Create embeddings       (--text, --model)
+  ai kb list             List Knowledge Bases (RAG)
+  ai kb create           Create a Knowledge Base (--name, --description)
+  ai kb add              Ingest a doc            (--id, --file)
+  ai kb query            RAG query               (--id, --query, --top-k)
+  ai kb delete           Delete a Knowledge Base (--id)
+  ai usage               Show AI usage stats
+  ai guardrails show     Show org guardrail policy
+  ai guardrails enable   Enable guardrails
+  ai guardrails disable  Disable guardrails
+  ai guardrails test     Dry-run text against the policy (--text "...")
+  ai eval list           List evaluations
+  ai eval run            Run an evaluation matrix (--json '{...}')
+  ai eval show           Show an evaluation (--id ID)
+  ai eval delete         Delete an evaluation (--id ID)
+
+${BOLD}Lakehouse (DevskinLake):${NC}
+  lake catalog list             List Lakehouse databases
+  lake catalog create NAME      Create database (--description, --bucket)
+  lake catalog tables DB_ID     List tables in a database
+  lake catalog optimize T_ID    Run Iceberg OPTIMIZE on a table
+  lake catalog optimize-schedule T_ID --schedule @daily
+                                Set/clear the optimize schedule
+  lake catalog row-filters T_ID --add ROLE:PREDICATE | --clear
+  lake catalog column-masks T_ID --add COL:ROLE:hash|redact|partial | --clear
+  lake catalog mv list DB_ID    List materialized views
+  lake catalog mv create DB_ID  Create MV (--name, --query, --schedule)
+  lake catalog mv refresh MV_ID Refresh a materialized view
+  lake catalog mv delete MV_ID  Delete a materialized view
+  lake sql run "QUERY"          Submit a SQL query and poll until done
+  lake sql list                 List recent SQL queries
+  lake sql ask "QUESTION"       Genie NL->SQL (--database, --run)
+  lake sql saved list           List saved queries
+  lake sql saved create         Save a query (--name, --query FILE, --schedule)
+  lake sql saved run ID         Run a saved query
+  lake sql saved delete ID      Delete a saved query
+  lake spark list               List Spark jobs
+  lake spark create             Create Spark job (--name, --code FILE, --language)
+  lake spark run JOB_ID         Trigger a Spark job run
+  lake notebook list            List notebooks
+  lake notebook create          Create notebook (--name, --kernel)
+  lake notebook start ID        Start notebook pod (prints URL)
+  lake kafka list               List Kafka clusters
+  lake kafka create             Create Kafka cluster (--name)
+  lake kafka topic CLUSTER_ID   Create topic (--name, --partitions, --replication)
+  lake airflow list             List Airflow DAGs
+  lake airflow upload           Upload DAG (--name, --code FILE, --schedule)
+  lake airflow trigger DAG_ID   Trigger a DAG run
+  lake lineage                  Show data lineage graph
+  lake quality list             List data-quality rules
+  lake quality create           Create rule (--name, --expectations FILE)
+  lake admin status             Show health of the Lakehouse stack
+  lake admin deploy             Deploy/upgrade the entire Lakehouse stack
+  lake admin cost               Cost summary (current vs previous month per area)
+  lake admin warehouse          Trino warehouse status (workers/queries)
 
 ${BOLD}Billing:${NC}
   billing subscription   Show subscription
@@ -5779,6 +8177,36 @@ ${BOLD}Examples:${NC}
   devskin ai models
 
 EOF
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+#                          ADMIN COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+
+cmd_admin() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    delinquent-orgs|delinquent) admin_delinquent_orgs "$@" ;;
+    help|*)
+      cat <<EOF
+${BOLD}Usage:${NC} devskin admin <subcommand> [options]
+
+${BOLD}Subcommands:${NC}
+  delinquent-orgs                   List orgs with at least one OPEN invoice past dueDate
+                                    (requires platform admin auth)
+EOF
+      ;;
+  esac
+}
+
+admin_delinquent_orgs() {
+  _require_auth
+  local body data
+  body=$(_api_get "/admin/delinquent-orgs")
+  data=$(_extract_data "$body")
+  echo -e "${BOLD}Delinquent Organizations${NC}"
+  echo ""
+  echo "$data" | _format_table organizationId name overdueInvoices oldestOverdueDays totalOutstanding currency
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5861,6 +8289,8 @@ main() {
     k8s-svc|k8s-service)        cmd_k8s_svc "$@" ;;
     consumption|cost)            cmd_consumption "$@" ;;
     ai)                          cmd_ai "$@" ;;
+    lake|lakehouse|devskinlake)  cmd_lake "$@" ;;
+    admin)                       cmd_admin "$@" ;;
 
     version|--version|-v)
       echo "devskin v${VERSION}"

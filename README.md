@@ -83,14 +83,21 @@ devskin compute list
 
 ```
 devskin compute list                          List instances
-devskin compute create                        Create instance (--name, --type, --image)
-devskin compute get ID                        Show instance details
+devskin compute create                        Create instance (--name, --type, --image
+                                                [--keypair K] [--vpc V] [--subnet S] [--sg G]
+                                                [--monitoring-api-key FLUX_KEY])
+devskin compute get ID                        Show instance details (also surfaces
+                                                marketplace defaultCredentials,
+                                                servicePort, isProtocolOnly via /connect)
 devskin compute start ID                      Start instance
 devskin compute stop ID                       Stop instance
 devskin compute reboot ID                     Reboot instance
 devskin compute terminate ID                  Terminate instance
 devskin compute ssh ID                        SSH into instance
 ```
+
+Pass `--monitoring-api-key` (Flux project key from `admin-flux.devskin.com`)
+to auto-enroll the VM into observability at boot.
 
 Aliases: `ec2`
 
@@ -336,12 +343,18 @@ devskin iam policies delete ID                Delete policy
 
 ```
 devskin container list                        List container services
-devskin container create                      Create service (--name, --image)
+devskin container create                      Create service (--name, --image,
+                                                --cluster-id, --task-def-id, --port,
+                                                [--monitoring-api-key FLUX_KEY])
 devskin container get ID                      Show service details
 devskin container delete ID                   Delete service
 devskin container deploy ID                   Deploy/update service
 devskin container restart ID                  Restart service
+devskin container scale ID --replicas N       Scale service
 ```
+
+Pass `--monitoring-api-key` (Flux project key) to enroll the service into
+Flux observability at create time.
 
 Aliases: `containers`, `ecs`
 
@@ -562,6 +575,100 @@ Aliases: `cost`
 devskin billing subscription                  Show subscription
 devskin billing usage                         Show usage
 devskin billing invoices                      List invoices
+devskin billing reminders                     Show dunning reminder cadence per OPEN
+                                                invoice (reminderCount,
+                                                lastReminderSentAt, days overdue)
+```
+
+### Lakehouse (KubmixLake)
+
+```
+# Catalog
+devskin lake catalog list                              List databases
+devskin lake catalog create NAME [--description S]
+                          [--bucket BUCKET_ID]         Create a database
+devskin lake catalog delete DB_ID                      Delete a database
+devskin lake catalog tables DB_ID                      List tables in a database
+devskin lake catalog tables create DB_ID
+                          --name N
+                          --columns name:type,name:type
+                                                       Create an Iceberg table
+                                                       (schema is immutable)
+devskin lake catalog tables delete TABLE_ID            Delete a table
+devskin lake catalog optimize TABLE_ID
+                          [--sort-columns c1,c2]       Run Iceberg OPTIMIZE
+devskin lake catalog optimize-schedule TABLE_ID
+                          --schedule @hourly|@daily|@weekly|none
+                                                       Set/clear OPTIMIZE schedule
+devskin lake catalog row-filters TABLE_ID
+                          --add ROLE:PREDICATE | --clear
+                                                       Manage row-level access
+devskin lake catalog column-masks TABLE_ID
+                          --add COL:ROLE:hash|redact|partial | --clear
+                                                       Manage column masks
+devskin lake catalog mv list DB_ID                     List materialized views
+devskin lake catalog mv create DB_ID
+                          --name N --query "..."
+                          [--schedule @daily]          Create materialized view
+devskin lake catalog mv refresh MV_ID                  Refresh on-demand
+devskin lake catalog mv delete MV_ID                   Delete materialized view
+
+# SQL (Trino)
+devskin lake sql run "QUERY"                           Submit SQL, poll until done
+devskin lake sql list [--limit N]                      List recent queries
+devskin lake sql cancel QUERY_ID                       Cancel a running query
+devskin lake sql ask "QUESTION"
+                          [--database DB_ID] [--run]   Genie NL→SQL via AI
+devskin lake sql saved list                            List saved queries
+devskin lake sql saved create
+                          --name N --query FILE
+                          [--schedule @daily]          Save a query
+devskin lake sql saved run ID                          Run a saved query
+devskin lake sql saved delete ID                       Delete saved query
+
+# Spark
+devskin lake spark list                                List Spark jobs
+devskin lake spark create
+                          --name N --code FILE
+                          [--language pyspark|scala|sql]
+                          [--driver-cores N] [--driver-mem GB]
+                          [--executor-cores N] [--executor-mem GB]
+                          [--executors N] [--schedule CRON]
+                                                       Create a Spark job
+devskin lake spark run JOB_ID                          Trigger a job run
+devskin lake spark runs JOB_ID                         List runs of a job
+devskin lake spark logs JOB_ID RUN_ID                  Print driver logs of a run
+
+# Other
+devskin lake lineage                                   Show data lineage graph
+devskin lake quality list                              List data-quality rules
+devskin lake quality create
+                          --name N --expectations FILE
+                          [--table TABLE_ID]
+                          [--schedule CRON]            Create quality rule
+
+# Admin (lakehouse stack)
+devskin lake admin status                              Lakehouse stack health
+devskin lake admin deploy                              Deploy/upgrade the stack
+devskin lake admin cost                                Cost per area (curr vs prev month)
+devskin lake admin warehouse                           Trino warehouse status
+```
+
+The legacy `lake notebook|kafka|airflow` subcommands now exit 1 with a
+pointer to the marketplace VM flow:
+
+```bash
+devskin marketplace deploy mp-030 --name my-jupyter   # JupyterLab on tpl-206
+devskin marketplace deploy mp-040 --name my-kafka     # Apache Kafka on tpl-204
+devskin marketplace deploy mp-050 --name my-airflow   # Apache Airflow on tpl-205
+```
+
+### Admin -- Platform Operations
+
+```
+devskin admin delinquent-orgs                 List orgs with at least one OPEN
+                                              invoice past dueDate (requires
+                                              platform admin auth)
 ```
 
 ### AI Services
@@ -695,6 +802,44 @@ devskin consumption trends
 
 # Get cost forecast
 devskin consumption forecast
+```
+
+### Lakehouse — end-to-end ETL
+
+```bash
+# 1. Create a database backed by an S3 bucket
+devskin lake catalog create bronze --description "Raw landing zone"
+
+# 2. Create an Iceberg table (schema is immutable — drop+recreate to change)
+devskin lake catalog tables create db_abc123 \
+  --name orders \
+  --columns id:bigint,amount:double,created_at:timestamp,user_id:varchar
+
+# 3. Run a SQL query against the lake (Trino, async)
+devskin lake sql run "SELECT count(*) FROM bronze.orders WHERE created_at > current_date - interval '7' day"
+
+# 4. Spin up a JupyterLab VM for exploratory analysis (replaces managed Notebooks)
+devskin marketplace deploy mp-030 --name data-team-jupyter
+
+# 5. Spin up Airflow for orchestration (replaces managed Workflows)
+devskin marketplace deploy mp-050 --name etl-airflow
+
+# 6. Schedule recurring OPTIMIZE on the hot table
+devskin lake catalog optimize-schedule tbl_abc --schedule @daily
+
+# 7. Run a Spark job (PySpark) — print driver logs of the latest run
+devskin lake spark runs job_abc                    # find a runId
+devskin lake spark logs job_abc run_xyz            # tail driver logs
+```
+
+### Platform admin — dunning oversight
+
+```bash
+# Orgs that have OPEN invoices past dueDate (cadence: D+0/3/7/14/21/28 → UNCOLLECTIBLE at D+30)
+devskin admin delinquent-orgs
+
+# See who has been reminded and how many times
+devskin billing reminders
 ```
 
 ## Configuration
