@@ -608,12 +608,17 @@ ${BOLD}Usage:${NC} devskin db <subcommand> [options]
 ${BOLD}Subcommands:${NC}
   list                              List all database instances
   create --name NAME --engine ENGINE --class CLASS --storage SIZE
-                                    Create a new database instance
+         --user USER --password PASS --vpc VPC_ID
+         [--engine-version VER] [--region REGION] [--replicas N]
+                                    Create a new database instance.
+                                    --replicas N (0-5) provisions N
+                                    extra VMs as read-replicas for
+                                    MYSQL/POSTGRESQL/MARIADB.
   get ID                            Show database details
   start ID                          Start a stopped database
   stop ID                           Stop a running database
   reboot ID                         Reboot a database
-  delete ID                         Delete a database instance
+  delete ID                         Delete a database instance (cascades into all replicas)
   snapshot ID --name NAME           Create a snapshot of a database
 EOF
 }
@@ -627,25 +632,65 @@ db_list() {
 
   echo -e "${BOLD}Database Instances${NC}"
   echo ""
-  echo "$data" | _format_table id name engine status instanceClass storageGb
+  # Backend exposes `storage` (not `storageGb`) and adds `replicas` to
+  # the row shape. Older CLI columns were reading the wrong key and
+  # showed blank cells.
+  echo "$data" | _format_table id name engine status instanceClass storage replicas
 }
 
 db_create() {
   _require_auth
-  local name engine class storage
+  local name engine class storage user pass vpc engineVersion region replicas
   name=$(_parse_flag "--name" "$@")
   engine=$(_parse_flag "--engine" "$@")
   class=$(_parse_flag "--class" "$@")
   storage=$(_parse_flag "--storage" "$@")
+  user=$(_parse_flag "--user" "$@")
+  pass=$(_parse_flag "--password" "$@")
+  vpc=$(_parse_flag "--vpc" "$@")
+  engineVersion=$(_parse_flag "--engine-version" "$@")
+  region=$(_parse_flag "--region" "$@")
+  replicas=$(_parse_flag "--replicas" "$@")
 
   _require_arg "--name" "$name"
   _require_arg "--engine" "$engine"
   _require_arg "--class" "$class"
   _require_arg "--storage" "$storage"
+  # Backend's createDatabaseSchema requires user/password/vpcId; the
+  # old CLI never sent them, so the request always 400'd with
+  # VALIDATION_ERROR. Fail fast here with a clearer message.
+  _require_arg "--user" "$user"
+  _require_arg "--password" "$pass"
+  _require_arg "--vpc" "$vpc"
 
-  local payload="{\"name\":\"${name}\",\"engine\":\"${engine}\",\"instanceClass\":\"${class}\",\"storageGb\":${storage}}"
+  # UPPERCASE the engine -- backend's enum is MYSQL/POSTGRESQL/MARIADB/MONGODB/REDIS.
+  local engine_upper
+  engine_upper=$(echo "$engine" | tr '[:lower:]' '[:upper:]')
+  # Map common aliases.
+  case "$engine_upper" in
+    POSTGRES) engine_upper="POSTGRESQL" ;;
+    MONGO) engine_upper="MONGODB" ;;
+  esac
 
-  _info "Creating database ${BOLD}${name}${NC} ..."
+  # Sensible engine_version defaults so customers don't have to pick one
+  # (backend will also default but we want the CLI to be self-sufficient).
+  if [ -z "$engineVersion" ]; then
+    case "$engine_upper" in
+      MYSQL) engineVersion="8.0" ;;
+      POSTGRESQL) engineVersion="16" ;;
+      MARIADB) engineVersion="10.11" ;;
+      MONGODB) engineVersion="6.0" ;;
+      REDIS) engineVersion="7.0" ;;
+    esac
+  fi
+  [ -z "$region" ] && region="sa-east-1"
+  [ -z "$replicas" ] && replicas=0
+
+  local payload
+  payload=$(printf '{"name":"%s","engine":"%s","engineVersion":"%s","instanceClass":"%s","storage":%s,"username":"%s","password":"%s","vpcId":"%s","region":"%s","replicas":%s}' \
+    "$name" "$engine_upper" "$engineVersion" "$class" "$storage" "$user" "$pass" "$vpc" "$region" "$replicas")
+
+  _info "Creating database ${BOLD}${name}${NC} (${engine_upper}, ${replicas} replicas)..."
   local body
   body=$(_api_post "/database/instances" "$payload")
   local data
@@ -653,10 +698,12 @@ db_create() {
 
   _success "Database created."
   echo ""
-  echo "  ID:      $(echo "$data" | _json_get '.id')"
-  echo "  Name:    $(echo "$data" | _json_get '.name')"
-  echo "  Engine:  $(echo "$data" | _json_get '.engine')"
-  echo "  Status:  $(echo "$data" | _json_get '.status')"
+  echo "  ID:       $(echo "$data" | _json_get '.id')"
+  echo "  Name:     $(echo "$data" | _json_get '.name')"
+  echo "  Engine:   $(echo "$data" | _json_get '.engine')"
+  echo "  Status:   $(echo "$data" | _json_get '.status')"
+  echo "  Replicas: $(echo "$data" | _json_get '.replicas')"
+  echo "  Endpoint: $(echo "$data" | _json_get '.endpoint')"
 }
 
 db_get() {
