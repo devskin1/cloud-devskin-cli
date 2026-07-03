@@ -44,7 +44,7 @@ devskin login
 devskin whoami
 
 # 4. Create your first compute instance
-devskin compute create --name web-server --type t3.micro --image ami-ubuntu-22
+devskin compute create --name web-server --type t3.micro --image tpl-9100
 
 # 5. SSH into it
 devskin compute ssh i-12345
@@ -658,9 +658,9 @@ The legacy `lake notebook|kafka|airflow` subcommands now exit 1 with a
 pointer to the marketplace VM flow:
 
 ```bash
-devskin marketplace deploy mp-030 --name my-jupyter   # JupyterLab on tpl-206
-devskin marketplace deploy mp-040 --name my-kafka     # Apache Kafka on tpl-204
-devskin marketplace deploy mp-050 --name my-airflow   # Apache Airflow on tpl-205
+devskin marketplace deploy mp-030 --name my-jupyter   # JupyterLab on tpl-9203
+devskin marketplace deploy mp-040 --name my-kafka     # Apache Kafka on tpl-9201
+devskin marketplace deploy mp-050 --name my-airflow   # Apache Airflow on tpl-9202
 ```
 
 ### Admin -- Platform Operations
@@ -705,7 +705,7 @@ Aliases: `api-key`
 
 ```bash
 # Create a compute instance
-devskin compute create --name web-app --type t3.small --image ami-ubuntu-22
+devskin compute create --name web-app --type t3.small --image tpl-9100
 
 # Create a database
 devskin db create --name web-db --engine postgres --class db.t3.micro --storage 20

@@ -6909,7 +6909,7 @@ lake_spark_logs() {
 }
 
 # ── Notebook (DEPRECATED) ──────────────────────────────────────────────────
-# JupyterLab now ships as a marketplace VM (mp-030, tpl-206). The legacy
+# JupyterLab now ships as a marketplace VM (mp-030, tpl-9203). The legacy
 # /lakehouse/notebooks endpoints still exist but the supported flow is to
 # deploy a Jupyter VM via marketplace.
 _lake_notebook_deprecated() {
@@ -6931,7 +6931,7 @@ lake_notebook_start()  { _lake_notebook_deprecated; }
 lake_notebook_stop()   { _lake_notebook_deprecated; }
 
 # ── Kafka (DEPRECATED) ─────────────────────────────────────────────────────
-# Apache Kafka now ships as a marketplace VM (mp-040, tpl-204). The legacy
+# Apache Kafka now ships as a marketplace VM (mp-040, tpl-9201). The legacy
 # /lakehouse/streaming endpoints still exist but the supported flow is to
 # deploy a Kafka VM via marketplace.
 _lake_kafka_deprecated() {
@@ -8210,7 +8210,7 @@ ${BOLD}Environment Variables:${NC}
 ${BOLD}Examples:${NC}
   devskin configure
   devskin compute list
-  devskin compute create --name web-1 --type t3.micro --image ami-ubuntu-22
+  devskin compute create --name web-1 --type t3.micro --image tpl-9100
   devskin compute ssh i-12345
   devskin db create --name mydb --engine postgres --class db.t3.micro --storage 20
   devskin volume create --name data-vol --size 100 --type gp3
