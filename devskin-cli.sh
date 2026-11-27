@@ -12,7 +12,7 @@ set -euo pipefail
 VERSION="1.0.0"
 CONFIG_DIR="$HOME/.devskin"
 CONFIG_FILE="$CONFIG_DIR/config"
-API_URL="${DEVSKIN_API_URL:-https://cloud-api.devskin.com/api}"
+API_URL="${DEVSKIN_API_URL:-https://cloud-api.kubmix.com}"
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -32,6 +32,15 @@ _error()   { echo -e "${RED}>>>${NC} $*" >&2; }
 _fatal()   { _error "$@"; exit 1; }
 
 # ── Config helpers ──────────────────────────────────────────────────────────
+_api_base() {
+  local url
+  url=$(_config_get "api_url")
+  url="${url:-$API_URL}"
+  url="${url%/}"
+  url="${url%/api}"
+  printf '%s/api' "$url"
+}
+
 _config_get() {
   local key="$1"
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -209,12 +218,11 @@ _api_call() {
   local endpoint="$2"
   local data="${3:-}"
 
-  local token api_url
+  local token base
   token=$(_config_get "token")
-  api_url=$(_config_get "api_url")
-  api_url="${api_url:-$API_URL}"
+  base=$(_api_base)
 
-  local args=(-s -w "\n%{http_code}" -X "$method" "${api_url}/api${endpoint}" -H "Content-Type: application/json")
+  local args=(-s -w "\n%{http_code}" -X "$method" "${base}${endpoint}" -H "Content-Type: application/json")
   if [[ -n "$token" ]]; then
     args+=(-H "Authorization: Bearer $token")
   fi
@@ -223,7 +231,7 @@ _api_call() {
   fi
 
   local response http_code body
-  response=$(curl "${args[@]}" 2>/dev/null) || _fatal "Failed to connect to ${api_url}. Check your network and API URL."
+  response=$(curl "${args[@]}" 2>/dev/null) || _fatal "Failed to connect to ${base}. Check your network and API URL."
 
   http_code=$(echo "$response" | tail -1)
   body=$(echo "$response" | sed '$d')
@@ -6332,8 +6340,8 @@ ai_speak() {
   payload+="}"
 
   local out="speech-$(date +%s).mp3"
-  curl -sS -X POST "${API_BASE}/ai/text-to-speech" \
-    -H "Authorization: Bearer ${TOKEN}" \
+  curl -sS -X POST "$(_api_base)/ai/text-to-speech" \
+    -H "Authorization: Bearer $(_config_get "token")" \
     -H "Content-Type: application/json" \
     -d "$payload" -o "$out"
   echo "Saved: $out"

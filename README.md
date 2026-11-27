@@ -64,7 +64,7 @@ devskin compute list
 
 | Variable | Description |
 |----------|-------------|
-| `DEVSKIN_API_URL` | Override the API base URL (default: `https://api.devskin.cloud`) |
+| `DEVSKIN_API_URL` | Override the API base URL (default: `https://cloud-api.kubmix.com`, without `/api`) |
 | `DEVSKIN_OUTPUT` | Default output format: `table` or `json` |
 
 ## Command Reference
@@ -846,7 +846,7 @@ devskin billing reminders
 
 The CLI stores configuration in `~/.devskin/config`. The config file contains:
 
-- `api_url` -- The API endpoint
+- `api_url` -- The API host, for example `https://cloud-api.kubmix.com` (a trailing `/api` is ignored)
 - `token` -- Your authentication token
 
 The config directory is created with `700` permissions and the config file with `600` for security.
